@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use graph::prelude::{async_trait, s, tokio, Error, QueryExecutionError, StoreEventStreamBox};
 use graph::{
     data::graphql::{ext::DocumentExt, ObjectOrInterface},
@@ -30,7 +28,6 @@ pub trait Resolver: Sized + Send + Sync + 'static {
         field: &a::Field,
         field_definition: &s::Field,
         object_type: ObjectOrInterface<'_>,
-        arguments: &HashMap<&str, r::Value>,
     ) -> Result<r::Value, QueryExecutionError>;
 
     /// Resolves an object, `prefetched_object` is `Some` if the parent already calculated the value.
@@ -40,7 +37,6 @@ pub trait Resolver: Sized + Send + Sync + 'static {
         field: &a::Field,
         field_definition: &s::Field,
         object_type: ObjectOrInterface<'_>,
-        arguments: &HashMap<&str, r::Value>,
     ) -> Result<r::Value, QueryExecutionError>;
 
     /// Resolves an enum value for a given enum type.
@@ -60,7 +56,6 @@ pub trait Resolver: Sized + Send + Sync + 'static {
         _field: &a::Field,
         _scalar_type: &s::ScalarType,
         value: Option<r::Value>,
-        _argument_values: &HashMap<&str, r::Value>,
     ) -> Result<r::Value, QueryExecutionError> {
         // This code is duplicated.
         // See also c2112309-44fd-4a84-92a0-5a651e6ed548

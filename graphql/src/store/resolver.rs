@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::result;
 use std::sync::Arc;
 
@@ -249,7 +249,6 @@ impl Resolver for StoreResolver {
         field: &a::Field,
         _field_definition: &s::Field,
         object_type: ObjectOrInterface<'_>,
-        _arguments: &HashMap<&str, r::Value>,
     ) -> Result<r::Value, QueryExecutionError> {
         if let Some(child) = prefetched_objects {
             Ok(child)
@@ -269,7 +268,6 @@ impl Resolver for StoreResolver {
         field: &a::Field,
         field_definition: &s::Field,
         object_type: ObjectOrInterface<'_>,
-        _arguments: &HashMap<&str, r::Value>,
     ) -> Result<r::Value, QueryExecutionError> {
         let (prefetched_object, meta) = self.handle_meta(prefetched_object, &object_type)?;
         if let Some(meta) = meta {
