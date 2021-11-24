@@ -1,4 +1,6 @@
-use graph::prelude::{async_trait, s, tokio, Error, QueryExecutionError, StoreEventStreamBox};
+use graph::prelude::{
+    async_trait, s, tokio, ApiSchema, Error, QueryExecutionError, StoreEventStreamBox,
+};
 use graph::{
     data::graphql::{ext::DocumentExt, ObjectOrInterface},
     prelude::{r, QueryResult},
@@ -108,7 +110,7 @@ pub trait Resolver: Sized + Send + Sync + 'static {
     // Resolves a change stream for a given field.
     async fn resolve_field_stream(
         &self,
-        _schema: &s::Document,
+        _schema: &ApiSchema,
         _object_type: &s::ObjectType,
         _field: &a::Field,
     ) -> Result<StoreEventStreamBox, QueryExecutionError> {
