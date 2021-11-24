@@ -2,7 +2,7 @@ use graph::prelude::{
     async_trait, s, tokio, ApiSchema, Error, QueryExecutionError, StoreEventStreamBox,
 };
 use graph::{
-    data::graphql::{ext::DocumentExt, ObjectOrInterface},
+    data::graphql::ObjectOrInterface,
     prelude::{r, QueryResult},
 };
 
@@ -87,7 +87,7 @@ pub trait Resolver: Sized + Send + Sync + 'static {
     // Resolves an abstract type into the specific type of an object.
     fn resolve_abstract_type<'a>(
         &self,
-        schema: &'a s::Document,
+        schema: &'a ApiSchema,
         _abstract_type: &s::TypeDefinition,
         object_value: &r::Value,
     ) -> Option<&'a s::ObjectType> {
