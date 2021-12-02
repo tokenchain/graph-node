@@ -18,6 +18,14 @@ type Query {
     blockHash: Bytes!
     indexer: Bytes
   ): Bytes
+  """
+  Proofs of indexing for several deployments and blocks that can be shared and
+  compared in public without revealing the _actual_ proof of indexing that every
+  indexer has in their database
+  """
+  publicProofsOfIndexing(
+    requests: [ProofOfIndexingRequest!]!
+  ): [ProofOfIndexingResult!]!
   subgraphFeatures(subgraphId: String!): SubgraphFeatures!
 }
 
@@ -82,7 +90,6 @@ enum Health {
   failed
 }
 
-
 type SubgraphFeatures {
   features: [Feature!]!
   errors: [String!]!
@@ -90,8 +97,25 @@ type SubgraphFeatures {
 }
 
 enum Feature {
-  nonFatalErrors,
-  grafting,
-  fullTextSearch,
-  ipfsOnEthereumContracts,
+  nonFatalErrors
+  grafting
+  fullTextSearch
+  ipfsOnEthereumContracts
+}
+
+input BlockInput {
+  hash: Bytes!
+  number: BigInt!
+}
+
+input ProofOfIndexingRequest {
+  deployment: String!
+  block: BlockInput!
+}
+
+type ProofOfIndexingResult {
+  deployment: String!
+  block: Block!
+  "There may not be a proof of indexing available for the deployment and block"
+  proofOfIndexing: Bytes
 }

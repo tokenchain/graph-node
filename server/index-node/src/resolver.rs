@@ -4,14 +4,53 @@ use std::collections::{BTreeMap, HashMap};
 
 use graph::data::subgraph::features::detect_features;
 use graph::data::subgraph::{status, MAX_SPEC_VERSION};
-use graph::prelude::*;
 use graph::{
     components::store::StatusStore,
     data::graphql::{IntoValue, ObjectOrInterface, ValueMap},
 };
+use graph::{object, prelude::*};
 use graph_graphql::prelude::{ExecutionContext, Resolver};
 use std::convert::TryInto;
 use web3::types::{Address, H256};
+
+#[derive(Clone, Debug)]
+struct ProofOfIndexingRequest {
+    pub deployment: DeploymentHash,
+    pub block: BlockPtr,
+}
+
+impl TryFromValue for ProofOfIndexingRequest {
+    fn try_from_value(value: &r::Value) -> Result<Self, Error> {
+        match value {
+            r::Value::Object(o) => Ok(Self {
+                deployment: o.get_required::<DeploymentHash>("deployment")?,
+                block: o.get_required::<BlockPtr>("block")?,
+            }),
+            _ => Err(anyhow!(
+                "Cannot parse non-object value as ProofOfIndexingRequest: {:?}",
+                value
+            )),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProofOfIndexingResult {
+    pub deployment: DeploymentHash,
+    pub block: BlockPtr,
+    pub proof_of_indexing: Option<String>,
+}
+
+impl IntoValue for ProofOfIndexingResult {
+    fn into_value(self) -> r::Value {
+        object! {
+            __typename: "ProofOfIndexingResult",
+            deployment: self.deployment.to_string(),
+            block: self.block,
+            proofOfIndexing: self.proof_of_indexing,
+        }
+    }
+}
 
 /// Resolver for the index node GraphQL API.
 pub struct IndexNodeResolver<S, R, St> {
@@ -135,6 +174,50 @@ where
         };
 
         Ok(poi)
+    }
+
+    fn resolve_public_proofs_of_indexing(
+        &self,
+        argument_values: &HashMap<&str, r::Value>,
+    ) -> Result<r::Value, QueryExecutionError> {
+        let requests = argument_values
+            .get_required::<Vec<ProofOfIndexingRequest>>("requests")
+            .expect("valid requests required");
+
+        let zero_indexer = Some(Address::zero());
+        Ok(r::Value::List(
+            requests
+                .clone()
+                .iter()
+                .map(|request| {
+                    match futures::executor::block_on(self.store.get_proof_of_indexing(
+                        &request.deployment,
+                        &zero_indexer,
+                        request.block.clone(),
+                    )) {
+                        Ok(Some(poi)) => Some(poi),
+                        Ok(None) => None,
+                        Err(e) => {
+                            error!(
+                                self.logger,
+                                "Failed to query proof of indexing";
+                                "subgraph" => &request.deployment,
+                                "block" => format!("{}", request.block),
+                                "error" => format!("{:?}", e)
+                            );
+                            None
+                        }
+                    }
+                })
+                .zip(requests.into_iter())
+                .map(|(poi, request)| ProofOfIndexingResult {
+                    deployment: request.deployment,
+                    block: request.block,
+                    proof_of_indexing: poi.map(|poi| format!("0x{}", hex::encode(&poi))),
+                })
+                .map(IntoValue::into_value)
+                .collect(),
+        ))
     }
 
     fn resolve_indexing_status_for_version(
@@ -422,6 +505,11 @@ where
             // The top-level `indexingStatusesForSubgraphName` field
             (None, "SubgraphIndexingStatus", "indexingStatusesForSubgraphName") => {
                 self.resolve_indexing_statuses_for_subgraph_name(arguments)
+            }
+
+            // The top-level `publicProofsOfIndexing` field
+            (None, "ProofOfIndexingResult", "publicProofsOfIndexing") => {
+                self.resolve_public_proofs_of_indexing(arguments)
             }
 
             // Resolve fields of `Object` values (e.g. the `chains` field of `ChainIndexingStatus`)
