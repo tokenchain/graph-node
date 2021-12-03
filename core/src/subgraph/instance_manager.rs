@@ -27,8 +27,11 @@ use graph::{
 use lazy_static::lazy_static;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::task;
+
+const THRESHOLD: Duration = Duration::from_secs(30);
+// const THRESHOLD: Duration = Duration::from_secs(60 * 5);
 
 lazy_static! {
     /// Size limit of the entity LFU cache, in bytes.
@@ -461,6 +464,7 @@ where
     let id_for_err = ctx.inputs.deployment.hash.clone();
     let mut should_try_unfail_deterministic = true;
     let mut should_try_unfail_non_deterministic = true;
+    let mut skip_pointer_updates_timer = Instant::now();
 
     loop {
         debug!(logger, "Starting or restarting subgraph");
@@ -589,6 +593,24 @@ where
                 subgraph_metrics
                     .block_trigger_count
                     .observe(block.trigger_count() as f64);
+            }
+
+            let has_no_triggers_in_block = block.trigger_count() == 0;
+
+            // Since last update of empty block.
+            let time_elapsed = skip_pointer_updates_timer.elapsed();
+
+            let threshold_has_passed =
+                // For every THRESHOLD period amount of time, a pointer update should happen.
+                THRESHOLD.as_secs().checked_div(time_elapsed.as_secs()) == Some(0);
+
+            let should_skip_empty_block = has_no_triggers_in_block && threshold_has_passed;
+
+            if should_skip_empty_block {
+                info!(&logger, "SKIPPING BLOCK: {}", block_ptr);
+
+                skip_pointer_updates_timer = Instant::now();
+                continue;
             }
 
             let start = Instant::now();
