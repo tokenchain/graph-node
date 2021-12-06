@@ -148,11 +148,18 @@ fn key_stable_hash() {
     );
 }
 
-/// Supported types of store filters.
 #[derive(Clone, Debug, PartialEq)]
 pub enum EntityFilter {
     And(Vec<EntityFilter>),
-    Or(Vec<EntityFilter>),
+    Base(BaseEntityFilter),
+    Child(String, BaseEntityFilter),
+ }
+
+/// Supported types of store filters.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BaseEntityFilter {
+    And(Vec<BaseEntityFilter>),
+    Or(Vec<BaseEntityFilter>),
     Equal(Attribute, Value),
     Not(Attribute, Value),
     GreaterThan(Attribute, Value),
@@ -171,23 +178,6 @@ pub enum EntityFilter {
 
 // Define some convenience methods
 impl EntityFilter {
-    pub fn new_equal(
-        attribute_name: impl Into<Attribute>,
-        attribute_value: impl Into<Value>,
-    ) -> Self {
-        EntityFilter::Equal(attribute_name.into(), attribute_value.into())
-    }
-
-    pub fn new_in(
-        attribute_name: impl Into<Attribute>,
-        attribute_values: Vec<impl Into<Value>>,
-    ) -> Self {
-        EntityFilter::In(
-            attribute_name.into(),
-            attribute_values.into_iter().map(Into::into).collect(),
-        )
-    }
-
     pub fn and_maybe(self, other: Option<Self>) -> Self {
         use EntityFilter as f;
         match other {
@@ -459,10 +449,10 @@ impl EntityQuery {
                     if let EntityLink::Direct(attribute, _) = &window.link {
                         let filter = match attribute {
                             WindowAttribute::Scalar(name) => {
-                                EntityFilter::Equal(name.to_owned(), id.into())
+                                EntityFilter::Base(BaseEntityFilter::Equal(name.to_owned(), id.into()))
                             }
                             WindowAttribute::List(name) => {
-                                EntityFilter::Contains(name.to_owned(), Value::from(vec![id]))
+                                EntityFilter::Base(BaseEntityFilter::Contains(name.to_owned(), Value::from(vec![id])))
                             }
                         };
                         self.filter = Some(filter.and_maybe(self.filter));

@@ -16,8 +16,8 @@ use graph::{components::store::EntityType, data::graphql::*};
 use graph::{
     data::graphql::ext::DirectiveFinder,
     prelude::{
-        s, ApiSchema, AttributeNames, BlockNumber, ChildMultiplicity, EntityCollection,
-        EntityFilter, EntityLink, EntityOrder, EntityWindow, Logger, ParentLink,
+        s, ApiSchema, AttributeNames, EntityFilter, BaseEntityFilter, BlockNumber, ChildMultiplicity,
+        EntityCollection, EntityLink, EntityOrder, EntityWindow, Logger, ParentLink,
         QueryExecutionError, QueryStore, StoreError, Value as StoreValue, WindowAttribute,
     },
 };
@@ -633,6 +633,7 @@ fn execute_field(
         resolver.store.as_ref(),
         parents,
         &join,
+        ctx.query.schema.as_ref(),
         field,
         multiplicity,
         ctx.query.schema.types_for_interface(),
@@ -653,6 +654,7 @@ fn fetch(
     store: &(impl QueryStore + ?Sized),
     parents: &Vec<&mut Node>,
     join: &Join<'_>,
+    schema: &ApiSchema,
     field: &a::Field,
     multiplicity: ChildMultiplicity,
     types_for_interface: &BTreeMap<EntityType, Vec<s::ObjectType>>,
@@ -670,6 +672,7 @@ fn fetch(
         max_first,
         max_skip,
         selected_attrs,
+        schema,
     )?;
     query.query_id = Some(query_id);
 
@@ -682,8 +685,11 @@ fn fetch(
     query.logger = Some(logger);
     if let Some(r::Value::String(id)) = field.argument_value(ARG_ID.as_str()) {
         query.filter = Some(
-            EntityFilter::Equal(ARG_ID.to_owned(), StoreValue::from(id.to_owned()))
-                .and_maybe(query.filter),
+            EntityFilter::Base(BaseEntityFilter::Equal(
+                ARG_ID.to_owned(),
+                StoreValue::from(id.to_owned()),
+            ))
+            .and_maybe(query.filter),
         );
     }
 

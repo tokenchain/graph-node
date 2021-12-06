@@ -15,7 +15,7 @@ use lazy_static::lazy_static;
 
 use graph::prelude::{
     anyhow, r, serde_json, Attribute, BlockNumber, ChildMultiplicity, Entity, EntityCollection,
-    EntityFilter, EntityKey, EntityLink, EntityOrder, EntityRange, EntityWindow, ParentLink,
+    EntityFilter, BaseEntityFilter, EntityKey, EntityLink, EntityOrder, EntityRange, EntityWindow, ParentLink,
     QueryExecutionError, StoreError, Value,
 };
 use graph::{
@@ -776,18 +776,23 @@ impl<'a> QueryFragment<Pg> for PrefixComparison<'a> {
 /// column an attribute refers to
 #[derive(Debug, Clone)]
 pub struct QueryFilter<'a> {
-    filter: &'a EntityFilter,
+    filter: &'a BaseEntityFilter,
     table: &'a Table,
 }
 
 impl<'a> QueryFilter<'a> {
     pub fn new(filter: &'a EntityFilter, table: &'a Table) -> Result<Self, StoreError> {
-        Self::valid_attributes(filter, table)?;
-        Ok(QueryFilter { filter, table })
+        match filter {
+            EntityFilter::Base(base_filter) => {
+                Self::valid_attributes(base_filter, table)?;
+                Ok(QueryFilter { filter: base_filter, table })
+            },
+            _ => panic!("QueryFilter does not yet support EntityFilter::Child"),
+        }
     }
 
-    fn valid_attributes(filter: &'a EntityFilter, table: &'a Table) -> Result<(), StoreError> {
-        use EntityFilter::*;
+    fn valid_attributes(filter: &'a BaseEntityFilter, table: &'a Table) -> Result<(), StoreError> {
+        use BaseEntityFilter::*;
         match filter {
             And(filters) | Or(filters) => {
                 for filter in filters {
@@ -815,7 +820,7 @@ impl<'a> QueryFilter<'a> {
         Ok(())
     }
 
-    fn with(&self, filter: &'a EntityFilter) -> Self {
+    fn with(&self, filter: &'a BaseEntityFilter) -> Self {
         QueryFilter {
             filter,
             table: self.table,
@@ -830,7 +835,7 @@ impl<'a> QueryFilter<'a> {
 
     fn binary_op(
         &self,
-        filters: &Vec<EntityFilter>,
+        filters: &Vec<BaseEntityFilter>,
         op: &str,
         on_empty: &str,
         mut out: AstPass<Pg>,
@@ -1119,7 +1124,7 @@ impl<'a> QueryFragment<Pg> for QueryFilter<'a> {
         out.unsafe_to_cache_prepared();
 
         use Comparison as c;
-        use EntityFilter::*;
+        use BaseEntityFilter::*;
         match &self.filter {
             And(filters) => self.binary_op(filters, " and ", " true ", out)?,
             Or(filters) => self.binary_op(filters, " or ", " false ", out)?,
@@ -1617,6 +1622,7 @@ impl<'a> FilterWindow<'a> {
             }
         }
 
+        // Kamil: again, we apply the query filter (that may have both Base and Child) to a single table
         let query_filter = query_filter
             .map(|filter| QueryFilter::new(filter, table))
             .transpose()?;
@@ -1952,6 +1958,9 @@ impl<'a> FilterCollection<'a> {
                             .map(|rc| rc.as_ref())
                             .and_then(|table| {
                                 filter
+                                    // Kamil: here, we create a filter for every table, interesting, maybe in QueryFilter::new we should use only the filters matching the table? 
+                                    // Kamil: I don't think it's safe to split the filter into multiple filters because it may change the logic
+                                    // Kamil: I'm not sure why we apply the same filter to multiple tables...
                                     .map(|filter| QueryFilter::new(filter, table))
                                     .transpose()
                                     .map(|filter| (table, filter, column_names.clone()))
@@ -2032,16 +2041,21 @@ impl<'a> SortKey<'a> {
             if column.is_fulltext() {
                 match filter {
                     Some(entity_filter) => match entity_filter {
-                        EntityFilter::Equal(_, value) => {
-                            let sort_value = value.as_str();
-
-                            Ok(SortKey::Key {
-                                column,
-                                value: sort_value,
-                                direction,
-                            })
-                        }
-                        _ => unreachable!(),
+                        EntityFilter::Base(base_filter) => {
+                            match base_filter {
+                                BaseEntityFilter::Equal(_, value) => {
+                                    let sort_value = value.as_str();
+        
+                                    Ok(SortKey::Key {
+                                        column,
+                                        value: sort_value,
+                                        direction,
+                                    })
+                                },
+                                _ => unreachable!(),
+                            }
+                        },
+                        _ => panic!("SortKey does not yet support EntityFilter::Child"),
                     },
                     None => unreachable!(),
                 }

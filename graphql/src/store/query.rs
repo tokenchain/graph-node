@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::mem::discriminant;
 
 use graph::data::value::Object;
+use graph::prelude::s::Type;
 use graph::prelude::*;
 use graph::{components::store::EntityType, data::graphql::ObjectOrInterface};
 
@@ -27,8 +28,11 @@ pub(crate) fn build_query<'a>(
     max_first: u32,
     max_skip: u32,
     mut column_names: SelectedAttributes,
+    schema: &ApiSchema,
 ) -> Result<EntityQuery, QueryExecutionError> {
     let entity = entity.into();
+    // Kamil: Here, we build a collection based on the entity (single object or many objects for a single interface)
+    // Kamil: what happens if I go over the fields and collect their types (and resolve interfaces as well). Will it affect the sql query?
     let entity_types = EntityCollection::All(match &entity {
         ObjectOrInterface::Object(object) => {
             let selected_columns = column_names.get(object);
@@ -45,7 +49,7 @@ pub(crate) fn build_query<'a>(
     });
     let mut query = EntityQuery::new(parse_subgraph_id(entity)?, block, entity_types)
         .range(build_range(field, max_first, max_skip)?);
-    if let Some(filter) = build_filter(entity, field)? {
+    if let Some(filter) = build_filter(entity, field, schema)? {
         query = query.filter(filter);
     }
     let order = match (
@@ -110,9 +114,10 @@ fn build_range(
 fn build_filter(
     entity: ObjectOrInterface,
     field: &a::Field,
+    schema: &ApiSchema,
 ) -> Result<Option<EntityFilter>, QueryExecutionError> {
     match field.argument_value("where") {
-        Some(r::Value::Object(object)) => build_filter_from_object(entity, object),
+        Some(r::Value::Object(object)) => build_filter_from_object(entity, object, schema),
         Some(r::Value::Null) => Ok(None),
         None => match field.argument_value("text") {
             Some(r::Value::Object(filter)) => build_fulltext_filter_from_object(filter),
@@ -123,6 +128,61 @@ fn build_filter(
     }
 }
 
+fn resolve_type_name(ty: &Type) -> &String {
+    match ty {
+        Type::ListType(inner) => resolve_type_name(inner),
+        Type::NonNullType(inner) => resolve_type_name(inner),
+        Type::NamedType(name) => name,
+    }
+}
+
+// build_filter_from_object returns [EntityFilter::Child, EntityFilter::Base, EntityFilter::Child, EntityFilter::Base]
+
+/// Parses a GraphQL input object into an EntityFilter, if present.
+fn build_filter_from_object(
+    entity: ObjectOrInterface,
+    object: &Object,
+    schema: &ApiSchema,
+) -> Result<Option<EntityFilter>, QueryExecutionError> {
+    Ok(Some(EntityFilter::And({
+        object
+            .iter()
+            .map(|(key, value)| {
+                // Check if the field points to a child
+                if key.ends_with('_') { // Kamil: it would be nicer to use a function and an enum here (Enum::Child, Enum::FilterOp)
+                    let field_name = key.trim_end_matches('_').to_string();
+
+                    Ok(EntityFilter::Child(
+                        field_name.clone(),
+                        build_child_filter_from_key_value(entity, &field_name, value, schema)?,
+                    ))
+                } else {
+                    Ok(EntityFilter::Base(build_base_filter_from_key_value(
+                        entity, key, value,
+                    )?))
+                }
+            })
+            .collect::<Result<Vec<EntityFilter>, QueryExecutionError>>()?
+    })))
+}
+
+fn build_child_filter_from_key_value(
+    entity: ObjectOrInterface,
+    key: &String,
+    value: &r::Value,
+    schema: &ApiSchema,
+) -> Result<BaseEntityFilter, QueryExecutionError> {
+    let field = entity
+        .field(key)
+        .ok_or(QueryExecutionError::InvalidFilterError)?;
+    let type_name = resolve_type_name(&field.field_type);
+    let child_entity = schema
+        .object_or_interface(type_name.as_str())
+        .ok_or(QueryExecutionError::InvalidFilterError)?;
+
+    build_base_filter_from_key_value(child_entity, key, value)
+}
+
 fn build_fulltext_filter_from_object(
     object: &Object,
 ) -> Result<Option<EntityFilter>, QueryExecutionError> {
@@ -130,10 +190,10 @@ fn build_fulltext_filter_from_object(
         Err(QueryExecutionError::FulltextQueryRequiresFilter),
         |(key, value)| {
             if let r::Value::String(s) = value {
-                Ok(Some(EntityFilter::Equal(
+                Ok(Some(EntityFilter::Base(BaseEntityFilter::Equal(
                     key.clone(),
                     Value::String(s.clone()),
-                )))
+                ))))
             } else {
                 Err(QueryExecutionError::FulltextQueryRequiresFilter)
             }
@@ -141,48 +201,38 @@ fn build_fulltext_filter_from_object(
     )
 }
 
-/// Parses a GraphQL input object into an EntityFilter, if present.
-fn build_filter_from_object(
+fn build_base_filter_from_key_value(
     entity: ObjectOrInterface,
-    object: &Object,
-) -> Result<Option<EntityFilter>, QueryExecutionError> {
-    Ok(Some(EntityFilter::And({
-        object
-            .iter()
-            .map(|(key, value)| {
-                use self::sast::FilterOp::*;
+    key: &String,
+    value: &r::Value,
+) -> Result<BaseEntityFilter, QueryExecutionError> {
+    use self::sast::FilterOp::*;
 
-                let (field_name, op) = sast::parse_field_as_filter(key);
+    let (field_name, op) = sast::parse_field_as_filter(key);
 
-                let field = sast::get_field(entity, &field_name).ok_or_else(|| {
-                    QueryExecutionError::EntityFieldError(
-                        entity.name().to_owned(),
-                        field_name.clone(),
-                    )
-                })?;
+    let field = sast::get_field(entity, &field_name).ok_or_else(|| {
+        QueryExecutionError::EntityFieldError(entity.name().to_owned(), field_name.clone())
+    })?;
 
-                let ty = &field.field_type;
-                let store_value = Value::from_query_value(value, ty)?;
+    let ty = &field.field_type;
+    let store_value = Value::from_query_value(value, ty)?;
 
-                Ok(match op {
-                    Not => EntityFilter::Not(field_name, store_value),
-                    GreaterThan => EntityFilter::GreaterThan(field_name, store_value),
-                    LessThan => EntityFilter::LessThan(field_name, store_value),
-                    GreaterOrEqual => EntityFilter::GreaterOrEqual(field_name, store_value),
-                    LessOrEqual => EntityFilter::LessOrEqual(field_name, store_value),
-                    In => EntityFilter::In(field_name, list_values(store_value, "_in")?),
-                    NotIn => EntityFilter::NotIn(field_name, list_values(store_value, "_not_in")?),
-                    Contains => EntityFilter::Contains(field_name, store_value),
-                    NotContains => EntityFilter::NotContains(field_name, store_value),
-                    StartsWith => EntityFilter::StartsWith(field_name, store_value),
-                    NotStartsWith => EntityFilter::NotStartsWith(field_name, store_value),
-                    EndsWith => EntityFilter::EndsWith(field_name, store_value),
-                    NotEndsWith => EntityFilter::NotEndsWith(field_name, store_value),
-                    Equal => EntityFilter::Equal(field_name, store_value),
-                })
-            })
-            .collect::<Result<Vec<EntityFilter>, QueryExecutionError>>()?
-    })))
+    Ok(match op {
+        Not => BaseEntityFilter::Not(field_name, store_value),
+        GreaterThan => BaseEntityFilter::GreaterThan(field_name, store_value),
+        LessThan => BaseEntityFilter::LessThan(field_name, store_value),
+        GreaterOrEqual => BaseEntityFilter::GreaterOrEqual(field_name, store_value),
+        LessOrEqual => BaseEntityFilter::LessOrEqual(field_name, store_value),
+        In => BaseEntityFilter::In(field_name, list_values(store_value, "_in")?),
+        NotIn => BaseEntityFilter::NotIn(field_name, list_values(store_value, "_not_in")?),
+        Contains => BaseEntityFilter::Contains(field_name, store_value),
+        NotContains => BaseEntityFilter::NotContains(field_name, store_value),
+        StartsWith => BaseEntityFilter::StartsWith(field_name, store_value),
+        NotStartsWith => BaseEntityFilter::NotStartsWith(field_name, store_value),
+        EndsWith => BaseEntityFilter::EndsWith(field_name, store_value),
+        NotEndsWith => BaseEntityFilter::NotEndsWith(field_name, store_value),
+        Equal => BaseEntityFilter::Equal(field_name, store_value),
+    })
 }
 
 /// Parses a list of GraphQL values into a vector of entity field values.

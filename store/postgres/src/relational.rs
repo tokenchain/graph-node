@@ -35,9 +35,9 @@ use graph::data::schema::{FulltextConfig, FulltextDefinition, Schema, SCHEMA_TYP
 use graph::data::store::BYTES_SCALAR;
 use graph::data::subgraph::schema::{POI_OBJECT, POI_TABLE};
 use graph::prelude::{
-    anyhow, info, BlockNumber, DeploymentHash, Entity, EntityChange, EntityCollection,
-    EntityFilter, EntityKey, EntityOrder, EntityRange, Logger, QueryExecutionError, StoreError,
-    StoreEvent, ValueType, BLOCK_NUMBER_MAX,
+    anyhow, info, BlockNumber, DeploymentHash, Entity, EntityChange,
+    EntityCollection, EntityFilter, EntityKey, EntityOrder, EntityRange, Logger,
+    QueryExecutionError, StoreError, StoreEvent, ValueType, BLOCK_NUMBER_MAX,
 };
 
 use crate::block_range::BLOCK_RANGE_COLUMN;
@@ -230,6 +230,10 @@ pub struct Layout {
     /// The query to count all entities
     pub count_query: String,
 }
+
+// Kamil: we get get the name of the table based on `type.field: [ChildType]` where `ChildType` maps to Layout.tables[ChildType] (EntityFilter::Child(field, ...))
+// Kamil: I think it's fine to put all OR and AND condition next to each other even if they reference different tables (entities), we just need to prefix them correctly.
+// Kamil: EntityFilter has ::And and ::Or, we need to implement the same logic for them as in BaseEntityFilter
 
 impl Layout {
     /// Generate a layout for a relational schema for entities in the
@@ -602,8 +606,8 @@ impl Layout {
         &self,
         logger: &Logger,
         conn: &PgConnection,
-        collection: EntityCollection,
-        filter: Option<EntityFilter>,
+        collection: EntityCollection, // Kamil: I think this has to contain all used entities
+        filter: Option<EntityFilter>, // Kamil: I think this is fine, we need to create a filter for two columns somewhere underneath this mod 
         order: EntityOrder,
         range: EntityRange,
         block: BlockNumber,
