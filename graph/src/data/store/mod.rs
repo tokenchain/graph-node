@@ -1,6 +1,7 @@
 use crate::{
     components::store::{DeploymentLocator, EntityType},
     prelude::{q, r, s, CacheWeight, EntityKey, QueryExecutionError},
+    runtime::gas::{Gas, GasSizeOf},
 };
 use crate::{data::subgraph::DeploymentHash, prelude::EntityChange};
 use anyhow::{anyhow, Error};
@@ -8,6 +9,7 @@ use itertools::Itertools;
 use serde::de;
 use serde::{Deserialize, Serialize};
 use stable_hash::prelude::*;
+use std::convert::TryFrom;
 use std::fmt;
 use std::iter::FromIterator;
 use std::str::FromStr;
@@ -15,7 +17,6 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap},
 };
-use std::{convert::TryFrom, num::NonZeroU64};
 use strum::AsStaticRef as _;
 use strum_macros::AsStaticStr;
 
@@ -26,7 +27,7 @@ pub mod scalar;
 pub mod ethereum;
 
 /// Filter subscriptions
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SubscriptionFilter {
     /// Receive updates about all entities from the given deployment of the
     /// given type
@@ -622,30 +623,9 @@ impl CacheWeight for Entity {
     }
 }
 
-pub type Vid = Option<NonZeroU64>;
-
-#[derive(Clone, Default, Debug)]
-pub struct EntityVersion {
-    pub data: Entity,
-    /// The `vid` of the entity if it exists in the store
-    pub vid: Vid,
-}
-
-impl EntityVersion {
-    pub fn new(data: Entity, vid: Vid) -> Self {
-        EntityVersion { data, vid }
-    }
-}
-
-impl From<EntityVersion> for Entity {
-    fn from(ev: EntityVersion) -> Self {
-        ev.data
-    }
-}
-
-impl CacheWeight for EntityVersion {
-    fn indirect_weight(&self) -> usize {
-        self.data.weight()
+impl GasSizeOf for Entity {
+    fn gas_size_of(&self) -> Gas {
+        self.0.gas_size_of()
     }
 }
 

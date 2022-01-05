@@ -1,7 +1,6 @@
 //! Test mapping of GraphQL schema to a relational schema
 use diesel::connection::SimpleConnection as _;
 use diesel::pg::PgConnection;
-use graph::data::store::{EntityVersion, Vid};
 use graph::prelude::{
     o, slog, tokio, web3::types::H256, DeploymentHash, Entity, EntityCollection, EntityFilter,
     EntityKey, EntityOrder, EntityQuery, EntityRange, Logger, Schema, StopwatchMetrics, Value,
@@ -14,9 +13,7 @@ use graph_store_postgres::layout_for_tests::SqlName;
 use hex_literal::hex;
 use lazy_static::lazy_static;
 use std::borrow::Cow;
-use std::collections::BTreeMap;
-use std::iter::FromIterator;
-use std::num::NonZeroU64;
+use std::panic;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::thread::sleep;
@@ -206,7 +203,7 @@ fn insert_entity(
     layout: &Layout,
     entity_type: &str,
     mut entities: Vec<Entity>,
-) -> BTreeMap<String, Vid> {
+) {
     let entities_with_keys_owned = entities
         .drain(..)
         .map(|entity| {
@@ -235,63 +232,48 @@ fn insert_entity(
             0,
             &MOCK_STOPWATCH,
         )
-        .expect(&errmsg)
-        .len();
+        .expect(&errmsg);
     assert_eq!(inserted, entities_with_keys_owned.len());
-    let ids_for_type = {
-        let ids: Vec<_> = entities_with_keys_owned
-            .iter()
-            .map(|(key, _)| key.entity_id.as_str())
-            .collect();
-        let mut map = BTreeMap::new();
-        map.insert(&entity_type, ids);
-        map
-    };
-
-    let ids = layout
-        .find_many(conn, &ids_for_type, 0)
-        .unwrap()
-        .get(&entity_type)
-        .unwrap()
-        .to_owned()
-        .into_iter()
-        .map(|ev| (ev.data.id().unwrap(), ev.vid));
-    BTreeMap::from_iter(ids)
 }
 
 fn update_entity(
     conn: &PgConnection,
     layout: &Layout,
     entity_type: &str,
-    entity: Entity,
-    prev_vid: Vid,
+    mut entities: Vec<Entity>,
 ) {
-    let key = EntityKey::data(
-        THINGS_SUBGRAPH_ID.clone(),
-        entity_type.to_owned(),
-        entity.id().unwrap(),
-    );
-    let mut entity_with_keys = vec![(&key, Cow::from(&entity))];
-    let vids = vec![prev_vid];
+    let entities_with_keys_owned: Vec<(EntityKey, Entity)> = entities
+        .drain(..)
+        .map(|entity| {
+            let key = EntityKey::data(
+                THINGS_SUBGRAPH_ID.clone(),
+                entity_type.to_owned(),
+                entity.id().unwrap(),
+            );
+            (key, entity)
+        })
+        .collect();
+    let mut entities_with_keys: Vec<_> = entities_with_keys_owned
+        .iter()
+        .map(|(key, entity)| (key, Cow::from(entity)))
+        .collect();
 
     let entity_type = EntityType::from(entity_type);
     let errmsg = format!(
         "Failed to insert entities {}[{:?}]",
-        entity_type, entity_with_keys
+        entity_type, entities_with_keys
     );
 
     let updated = layout
         .update(
             &conn,
             &entity_type,
-            &mut entity_with_keys,
-            &vids,
+            &mut entities_with_keys,
             0,
             &MOCK_STOPWATCH,
         )
-        .expect(&errmsg)
-        .len();
-    assert_eq!(updated, 1);
+        .expect(&errmsg);
+    assert_eq!(updated, entities_with_keys_owned.len());
 }
 
 fn insert_user_entity(
@@ -306,7 +288,7 @@ fn insert_user_entity(
     coffee: bool,
     favorite_color: Option<&str>,
     drinks: Option<Vec<&str>>,
-) -> BTreeMap<String, Vid> {
+) {
     let mut user = Entity::new();
 
     user.insert("id".to_owned(), Value::String(id.to_owned()));
@@ -331,11 +313,11 @@ fn insert_user_entity(
         user.insert("drinks".to_owned(), drinks.into());
     }
 
-    insert_entity(conn, layout, entity_type, vec![user])
+    insert_entity(conn, layout, entity_type, vec![user]);
 }
 
-fn insert_users(conn: &PgConnection, layout: &Layout) -> BTreeMap<String, Vid> {
-    let mut vid_map = insert_user_entity(
+fn insert_users(conn: &PgConnection, layout: &Layout) {
+    insert_user_entity(
         conn,
         layout,
         "1",
@@ -348,7 +330,7 @@ fn insert_users(conn: &PgConnection, layout: &Layout) -> BTreeMap<String, Vid> {
         Some("yellow"),
         None,
     );
-    vid_map.extend(insert_user_entity(
+    insert_user_entity(
         conn,
         layout,
         "2",
@@ -360,8 +342,8 @@ fn insert_users(conn: &PgConnection, layout: &Layout) -> BTreeMap<String, Vid> {
         true,
         Some("red"),
         Some(vec!["beer", "wine"]),
-    ));
-    vid_map.extend(insert_user_entity(
+    );
+    insert_user_entity(
         conn,
         layout,
         "3",
@@ -373,14 +355,12 @@ fn insert_users(conn: &PgConnection, layout: &Layout) -> BTreeMap<String, Vid> {
         false,
         None,
         Some(vec!["coffee", "tea"]),
-    ));
-    vid_map
+    );
 }
 
 fn update_user_entity(
     conn: &PgConnection,
     layout: &Layout,
-    vid: Vid,
     id: &str,
     entity_type: &str,
     name: &str,
@@ -415,7 +395,7 @@ fn update_user_entity(
         user.insert("drinks".to_owned(), drinks.into());
     }
 
-    update_entity(conn, layout, entity_type, user, vid);
+    update_entity(conn, layout, entity_type, vec![user]);
 }
 
 fn insert_pet(conn: &PgConnection, layout: &Layout, entity_type: &str, id: &str, name: &str) {
@@ -458,7 +438,7 @@ macro_rules! assert_entity_eq {
         let mut pass = true;
 
         for (key, left_value) in left.clone().sorted() {
-            match right.data.get(&key) {
+            match right.get(&key) {
                 None => {
                     pass = false;
                     println!("key '{}' missing from right", key);
@@ -474,7 +454,7 @@ macro_rules! assert_entity_eq {
                 }
             }
         }
-        for (key, _) in right.data.clone().sorted() {
+        for (key, _) in right.clone().sorted() {
             if left.get(&key).is_none() {
                 pass = false;
                 println!("key '{}' missing from left", key);
@@ -553,9 +533,7 @@ fn insert_null_fulltext_fields() {
 #[test]
 fn update() {
     run_test(|conn, layout| {
-        let vids: Vec<_> = insert_entity(&conn, &layout, "Scalar", vec![SCALAR_ENTITY.clone()])
-            .into_values()
-            .collect();
+        insert_entity(&conn, &layout, "Scalar", vec![SCALAR_ENTITY.clone()]);
 
         // Update with overwrite
         let mut entity = SCALAR_ENTITY.clone();
@@ -571,14 +549,7 @@ fn update() {
         let entity_type = EntityType::from("Scalar");
         let mut entities = vec![(&key, Cow::from(&entity))];
         layout
-            .update(
-                &conn,
-                &entity_type,
-                &mut entities,
-                &vids,
-                0,
-                &MOCK_STOPWATCH,
-            )
+            .update(&conn, &entity_type, &mut entities, 0, &MOCK_STOPWATCH)
             .expect("Failed to update");
 
         let actual = layout
@@ -597,14 +568,12 @@ fn update_many() {
         two.set("id", "two");
         let mut three = SCALAR_ENTITY.clone();
         three.set("id", "three");
-        let vids: Vec<_> = insert_entity(
+        insert_entity(
             &conn,
             &layout,
             "Scalar",
             vec![one.clone(), two.clone(), three.clone()],
-        )
-        .into_values()
-        .collect();
+        );
 
         // confidence test: there should be 3 scalar entities in store right now
         assert_eq!(3, count_scalar_entities(conn, layout));
@@ -640,14 +609,7 @@ fn update_many() {
             .collect();
 
         layout
-            .update(
-                &conn,
-                &entity_type,
-                &mut entities,
-                &vids,
-                0,
-                &MOCK_STOPWATCH,
-            )
+            .update(&conn, &entity_type, &mut entities, 0, &MOCK_STOPWATCH)
             .expect("Failed to update");
 
         // check updates took effect
@@ -658,7 +620,6 @@ fn update_many() {
                     .find(conn, &*SCALAR, id, BLOCK_NUMBER_MAX)
                     .expect(&format!("Failed to read Scalar[{}]", id))
                     .unwrap()
-                    .data
             })
             .collect();
         let new_one = &updated[0];
@@ -699,9 +660,7 @@ fn update_many() {
 #[test]
 fn serialize_bigdecimal() {
     run_test(|conn, layout| {
-        let mut vids: Vec<_> = insert_entity(&conn, &layout, "Scalar", vec![SCALAR_ENTITY.clone()])
-            .into_values()
-            .collect();
+        insert_entity(&conn, &layout, "Scalar", vec![SCALAR_ENTITY.clone()]);
 
         // Update with overwrite
         let mut entity = SCALAR_ENTITY.clone();
@@ -722,7 +681,6 @@ fn serialize_bigdecimal() {
                     &conn,
                     &entity_type,
                     entities.as_mut_slice(),
-                    &vids,
                     0,
                     &MOCK_STOPWATCH,
                 )
@@ -733,7 +691,6 @@ fn serialize_bigdecimal() {
                 .expect("Failed to read Scalar[one]")
                 .unwrap();
             assert_entity_eq!(entity, actual);
-            vids = vec![actual.vid]
         }
     });
 }
@@ -745,7 +702,7 @@ fn count_scalar_entities(conn: &PgConnection, layout: &Layout) -> usize {
     ]);
     let collection = EntityCollection::All(vec![(SCALAR.to_owned(), AttributeNames::All)]);
     layout
-        .query::<EntityVersion>(
+        .query::<Entity>(
             &*LOGGER,
             &conn,
             collection,
@@ -765,9 +722,10 @@ fn count_scalar_entities(conn: &PgConnection, layout: &Layout) -> usize {
 #[test]
 fn delete() {
     run_test(|conn, layout| {
+        insert_entity(&conn, &layout, "Scalar", vec![SCALAR_ENTITY.clone()]);
         let mut two = SCALAR_ENTITY.clone();
         two.set("id", "two");
-        let vids = insert_entity(&conn, &layout, "Scalar", vec![SCALAR_ENTITY.clone(), two]);
+        insert_entity(&conn, &layout, "Scalar", vec![two]);
 
         // Delete where nothing is getting deleted
         let key = EntityKey::data(
@@ -781,7 +739,7 @@ fn delete() {
             .delete(
                 &conn,
                 &entity_type.clone(),
-                &[NonZeroU64::new(713)],
+                &entity_keys,
                 1,
                 &MOCK_STOPWATCH,
             )
@@ -790,14 +748,13 @@ fn delete() {
         assert_eq!(2, count_scalar_entities(conn, layout));
 
         // Delete entity two
-        let vid = *vids.get("two").unwrap();
         entity_keys
             .get_mut(0)
             .map(|key| *key = "two")
             .expect("Failed to update key");
 
         let count = layout
-            .delete(&conn, &entity_type, &vec![vid], 1, &MOCK_STOPWATCH)
+            .delete(&conn, &entity_type, &entity_keys, 1, &MOCK_STOPWATCH)
             .expect("Failed to delete");
         assert_eq!(1, count);
         assert_eq!(1, count_scalar_entities(conn, layout));
@@ -812,7 +769,7 @@ fn insert_many_and_delete_many() {
         two.set("id", "two");
         let mut three = SCALAR_ENTITY.clone();
         three.set("id", "three");
-        let vids = insert_entity(&conn, &layout, "Scalar", vec![one, two, three]);
+        insert_entity(&conn, &layout, "Scalar", vec![one, two, three]);
 
         // confidence test: there should be 3 scalar entities in store right now
         assert_eq!(3, count_scalar_entities(conn, layout));
@@ -820,13 +777,8 @@ fn insert_many_and_delete_many() {
         // Delete entities with ids equal to "two" and "three"
         let entity_type = EntityType::from("Scalar");
         let entity_keys = vec!["two", "three"];
-        let vids: Vec<_> = vids
-            .iter()
-            .filter(|(id, _)| entity_keys.contains(&id.as_str()))
-            .map(|(_, vid)| *vid)
-            .collect();
         let num_removed = layout
-            .delete(&conn, &entity_type, &vids, 1, &MOCK_STOPWATCH)
+            .delete(&conn, &entity_type, &entity_keys, 1, &MOCK_STOPWATCH)
             .expect("Failed to delete");
         assert_eq!(2, num_removed);
         assert_eq!(1, count_scalar_entities(conn, layout));
@@ -918,12 +870,10 @@ struct QueryChecker<'a> {
 
 impl<'a> QueryChecker<'a> {
     fn new(conn: &'a PgConnection, layout: &'a Layout) -> Self {
-        let vid_map = insert_users(conn, layout);
-        let vid = *vid_map.get("1").unwrap();
+        insert_users(conn, layout);
         update_user_entity(
             conn,
             layout,
-            vid,
             "1",
             "User",
             "Jono",
@@ -940,10 +890,11 @@ impl<'a> QueryChecker<'a> {
     }
 
     fn check(self, expected_entity_ids: Vec<&'static str>, query: EntityQuery) -> Self {
+        let q = query.clone();
         let unordered = matches!(query.order, EntityOrder::Unordered);
         let entities = self
             .layout
-            .query::<EntityVersion>(
+            .query::<Entity>(
                 &*LOGGER,
                 self.conn,
                 query.collection,
@@ -957,7 +908,7 @@ impl<'a> QueryChecker<'a> {
 
         let mut entity_ids: Vec<_> = entities
             .into_iter()
-            .map(|ev| match ev.data.get("id") {
+            .map(|entity| match entity.get("id") {
                 Some(Value::String(id)) => id.to_owned(),
                 Some(_) => panic!("layout.query returned entity with non-string ID attribute"),
                 None => panic!("layout.query returned entity with no ID attribute"),
@@ -972,7 +923,7 @@ impl<'a> QueryChecker<'a> {
             expected_entity_ids.sort();
         }
 
-        assert_eq!(entity_ids, expected_entity_ids);
+        assert_eq!(entity_ids, expected_entity_ids, "{:?}", q);
         self
     }
 }
@@ -1014,6 +965,19 @@ impl EasyOrder for EntityQuery {
     fn unordered(self) -> Self {
         self.order(EntityOrder::Unordered)
     }
+}
+
+#[test]
+#[should_panic(
+    expected = "layout.query failed to execute query: FulltextQueryInvalidSyntax(\"syntax error in tsquery: \\\"Jono 'a\\\"\")"
+)]
+fn check_fulltext_search_syntax_error() {
+    run_test(move |conn, layout| {
+        QueryChecker::new(conn, layout).check(
+            vec!["1"],
+            user_query().filter(EntityFilter::Equal("userSearch".into(), "Jono 'a".into())),
+        );
+    });
 }
 
 #[test]
@@ -1538,7 +1502,7 @@ fn text_find(expected_entity_ids: Vec<&str>, filter: EntityFilter) {
         let query = query(vec!["Ferret"]).filter(filter).asc("id");
 
         let entities = layout
-            .query::<EntityVersion>(
+            .query::<Entity>(
                 &*LOGGER,
                 conn,
                 query.collection,
@@ -1552,7 +1516,7 @@ fn text_find(expected_entity_ids: Vec<&str>, filter: EntityFilter) {
 
         let entity_ids: Vec<_> = entities
             .into_iter()
-            .map(|ev| match ev.data.get("id") {
+            .map(|entity| match entity.get("id") {
                 Some(Value::String(id)) => id.to_owned(),
                 Some(_) => panic!("layout.query returned entity with non-string ID attribute"),
                 None => panic!("layout.query returned entity with no ID attribute"),

@@ -17,16 +17,13 @@ use graph::{
     constraint_violation,
     data::query::QueryTarget,
     data::subgraph::schema::{self, SubgraphError},
-    data::{
-        store::{EntityVersion, Vid},
-        subgraph::status,
-    },
+    data::subgraph::status,
     prelude::StoreEvent,
     prelude::SubgraphDeploymentEntity,
     prelude::{
         anyhow, futures03::future::join_all, lazy_static, o, web3::types::Address, ApiSchema,
-        BlockPtr, DeploymentHash, EntityKey, EntityModification, Error, Logger, NodeId, Schema,
-        StopwatchMetrics, StoreError, SubgraphName, SubgraphStore as SubgraphStoreTrait,
+        BlockPtr, DeploymentHash, Entity, EntityKey, EntityModification, Error, Logger, NodeId,
+        Schema, StopwatchMetrics, StoreError, SubgraphName, SubgraphStore as SubgraphStoreTrait,
         SubgraphVersionSwitchingMode,
     },
     slog::{error, warn},
@@ -84,7 +81,7 @@ impl Shard {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         {
             return Err(StoreError::InvalidIdentifier(format!(
-                "shard names must only contain lowercase alphanumeric characters or '_'"
+                "shard name `{}` is invalid: shard names must only contain lowercase alphanumeric characters or '_'", name
             )));
         }
         Ok(Shard(name))
@@ -114,22 +111,29 @@ impl ToSql<Text, Pg> for Shard {
     }
 }
 
-/// Decide where a new deployment should be placed based on the subgraph name
-/// and the network it is indexing. If the deployment can be placed, returns
-/// the name of the database shard for the deployment and the names of the
-/// indexers that should index it. The deployment should then be assigned to
-/// one of the returned indexers.
+/// Decide where a new deployment should be placed based on the subgraph
+/// name and the network it is indexing. If the deployment can be placed,
+/// returns a list of eligible database shards for the deployment and the
+/// names of the indexers that should index it. The deployment should then
+/// be assigned to one of the returned indexers and placed into one of the
+/// shards.
 pub trait DeploymentPlacer {
-    fn place(&self, name: &str, network: &str) -> Result<Option<(Shard, Vec<NodeId>)>, String>;
+    fn place(&self, name: &str, network: &str)
+        -> Result<Option<(Vec<Shard>, Vec<NodeId>)>, String>;
 }
 
 /// Tools for managing unused deployments
 pub mod unused {
+    use graph::prelude::chrono::Duration;
+
     pub enum Filter {
         /// List all unused deployments
         All,
         /// List only deployments that are unused but have not been removed yet
         New,
+        /// List only deployments that were recorded as unused at least this
+        /// long ago but have not been removed at
+        UnusedLongerThan(Duration),
     }
 }
 
@@ -380,6 +384,41 @@ impl SubgraphStoreInner {
         store.find_layout(site)
     }
 
+    fn place_on_node(
+        &self,
+        mut nodes: Vec<NodeId>,
+        default_node: NodeId,
+    ) -> Result<NodeId, StoreError> {
+        match nodes.len() {
+            0 => {
+                // This is really a configuration error
+                Ok(default_node)
+            }
+            1 => Ok(nodes.pop().unwrap()),
+            _ => {
+                let conn = self.primary_conn()?;
+
+                // unwrap is fine since nodes is not empty
+                let node = conn.least_assigned_node(&nodes)?.unwrap();
+                Ok(node)
+            }
+        }
+    }
+
+    fn place_in_shard(&self, mut shards: Vec<Shard>) -> Result<Shard, StoreError> {
+        match shards.len() {
+            0 => Ok(PRIMARY_SHARD.clone()),
+            1 => Ok(shards.pop().unwrap()),
+            _ => {
+                let conn = self.primary_conn()?;
+
+                // unwrap is fine since shards is not empty
+                let shard = conn.least_used_shard(&shards)?.unwrap();
+                Ok(shard)
+            }
+        }
+    }
+
     fn place(
         &self,
         name: &SubgraphName,
@@ -400,16 +439,10 @@ impl SubgraphStoreInner {
 
         match placement {
             None => Ok((PRIMARY_SHARD.clone(), default_node)),
-            Some((_, nodes)) if nodes.is_empty() => {
-                // This is really a configuration error
-                Ok((PRIMARY_SHARD.clone(), default_node))
-            }
-            Some((shard, mut nodes)) if nodes.len() == 1 => Ok((shard, nodes.pop().unwrap())),
-            Some((shard, nodes)) => {
-                let conn = self.primary_conn()?;
+            Some((shards, nodes)) => {
+                let node = self.place_on_node(nodes, default_node)?;
+                let shard = self.place_in_shard(shards)?;
 
-                // unwrap is fine since nodes is not empty
-                let node = conn.least_assigned_node(&nodes)?.unwrap();
                 Ok((shard, node))
             }
         }
@@ -734,36 +767,28 @@ impl SubgraphStoreInner {
         let store = self.for_site(site.as_ref())?;
 
         // Check that deployment is not assigned
-        match self.mirror.assigned_node(site.as_ref())? {
-            Some(node) => {
-                return Err(constraint_violation!(
-                    "deployment {} can not be removed since it is assigned to node {}",
-                    site.deployment.as_str(),
-                    node.as_str()
-                ));
-            }
-            None => { /* ok */ }
-        }
+        let mut removable = self.mirror.assigned_node(site.as_ref())?.is_some();
 
         // Check that it is not current/pending for any subgraph if it is
         // the active deployment of that subgraph
         if site.active {
-            let versions = self
+            if !self
                 .primary_conn()?
-                .subgraphs_using_deployment(site.as_ref())?;
-            if versions.len() > 0 {
-                return Err(constraint_violation!(
-                    "deployment {} can not be removed \
-                since it is the current or pending version for the subgraph(s) {}",
-                    site.deployment.as_str(),
-                    versions.join(", "),
-                ));
+                .subgraphs_using_deployment(site.as_ref())?
+                .is_empty()
+            {
+                removable = false;
             }
         }
 
-        store.drop_deployment(&site)?;
+        if removable {
+            store.drop_deployment(&site)?;
 
-        self.primary_conn()?.drop_site(site.as_ref())?;
+            self.primary_conn()?.drop_site(site.as_ref())?;
+        } else {
+            self.primary_conn()?
+                .unused_deployment_is_used(site.as_ref())?;
+        }
 
         Ok(())
     }
@@ -892,7 +917,7 @@ impl SubgraphStoreInner {
     pub fn find(
         &self,
         query: graph::prelude::EntityQuery,
-    ) -> Result<Vec<graph::prelude::Entity>, graph::prelude::QueryExecutionError> {
+    ) -> Result<Vec<Entity>, graph::prelude::QueryExecutionError> {
         let (store, site) = self.store(&query.subgraph_id)?;
         store.find(site, query)
     }
@@ -1231,7 +1256,7 @@ impl WritableStoreTrait for WritableStore {
         .await
     }
 
-    fn get(&self, key: &EntityKey) -> Result<Option<EntityVersion>, StoreError> {
+    fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError> {
         self.retry("get", || self.writable.get(self.site.cheap_clone(), key))
     }
 
@@ -1243,13 +1268,13 @@ impl WritableStoreTrait for WritableStore {
         stopwatch: StopwatchMetrics,
         data_sources: Vec<StoredDynamicDataSource>,
         deterministic_errors: Vec<SubgraphError>,
-    ) -> Result<Vec<(EntityKey, Vid)>, StoreError> {
+    ) -> Result<(), StoreError> {
         assert!(
             same_subgraph(&mods, &self.site.deployment),
             "can only transact operations within one shard"
         );
         self.retry("transact_block_operations", move || {
-            let (event, vid_map) = self.writable.transact_block_operations(
+            let event = self.writable.transact_block_operations(
                 self.site.clone(),
                 &block_ptr_to,
                 firehose_cursor.as_deref(),
@@ -1260,15 +1285,14 @@ impl WritableStoreTrait for WritableStore {
             )?;
 
             let _section = stopwatch.start_section("send_store_event");
-            self.try_send_store_event(event)?;
-            Ok(vid_map)
+            self.try_send_store_event(event)
         })
     }
 
     fn get_many(
         &self,
         ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
-    ) -> Result<BTreeMap<EntityType, Vec<EntityVersion>>, StoreError> {
+    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
         self.retry("get_many", || {
             self.writable
                 .get_many(self.site.cheap_clone(), &ids_for_type)

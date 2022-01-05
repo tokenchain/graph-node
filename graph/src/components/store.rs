@@ -553,7 +553,7 @@ impl<'a> FromIterator<&'a EntityModification> for StoreEvent {
             .map(|op| {
                 use self::EntityModification::*;
                 match op {
-                    Insert { key, .. } | Overwrite { key, .. } | Remove { key, .. } => {
+                    Insert { key, .. } | Overwrite { key, .. } | Remove { key } => {
                         EntityChange::for_data(key.clone())
                     }
                 }
@@ -588,7 +588,7 @@ impl StoreEvent {
         self
     }
 
-    pub fn matches(&self, filters: &Vec<SubscriptionFilter>) -> bool {
+    pub fn matches(&self, filters: &BTreeSet<SubscriptionFilter>) -> bool {
         self.changes
             .iter()
             .any(|change| filters.iter().any(|filter| filter.matches(change)))
@@ -623,6 +623,8 @@ pub struct StoreEventStream<S> {
 pub type StoreEventStreamBox =
     StoreEventStream<Box<dyn Stream<Item = Arc<StoreEvent>, Error = ()> + Send>>;
 
+pub type UnitStream = Box<dyn futures03::Stream<Item = ()> + Unpin + Send + Sync>;
+
 impl<S> Stream for StoreEventStream<S>
 where
     S: Stream<Item = Arc<StoreEvent>, Error = ()> + Send,
@@ -647,7 +649,7 @@ where
     /// Filter a `StoreEventStream` by subgraph and entity. Only events that have
     /// at least one change to one of the given (subgraph, entity) combinations
     /// will be delivered by the filtered stream.
-    pub fn filter_by_entities(self, filters: Vec<SubscriptionFilter>) -> StoreEventStreamBox {
+    pub fn filter_by_entities(self, filters: BTreeSet<SubscriptionFilter>) -> StoreEventStreamBox {
         let source = self.source.filter(move |event| event.matches(&filters));
 
         StoreEventStream::new(Box::new(source))
@@ -661,6 +663,8 @@ where
     /// on the returned stream as a single `StoreEvent`; the events are
     /// combined by using the maximum of all sources and the concatenation
     /// of the changes of the `StoreEvents` received during the interval.
+    //
+    // Currently unused, needs to be made compatible with `subscribe_no_payload`.
     pub async fn throttle_while_syncing(
         self,
         logger: &Logger,
@@ -848,7 +852,10 @@ pub trait SubscriptionManager: Send + Sync + 'static {
     /// Subscribe to changes for specific subgraphs and entities.
     ///
     /// Returns a stream of store events that match the input arguments.
-    fn subscribe(&self, entities: Vec<SubscriptionFilter>) -> StoreEventStreamBox;
+    fn subscribe(&self, entities: BTreeSet<SubscriptionFilter>) -> StoreEventStreamBox;
+
+    /// If the payload is not required, use for a more efficient subscription mechanism backed by a watcher.
+    fn subscribe_no_payload(&self, entities: BTreeSet<SubscriptionFilter>) -> UnitStream;
 }
 
 /// An internal identifer for the specific instance of a deployment. The
@@ -1034,7 +1041,7 @@ pub trait WritableStore: Send + Sync + 'static {
     async fn supports_proof_of_indexing(&self) -> Result<bool, StoreError>;
 
     /// Looks up an entity using the given store key at the latest block.
-    fn get(&self, key: &EntityKey) -> Result<Option<EntityVersion>, StoreError>;
+    fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError>;
 
     /// Transact the entity changes from a single block atomically into the store, and update the
     /// subgraph block pointer to `block_ptr_to`, and update the firehose cursor to `firehose_cursor`
@@ -1048,14 +1055,14 @@ pub trait WritableStore: Send + Sync + 'static {
         stopwatch: StopwatchMetrics,
         data_sources: Vec<StoredDynamicDataSource>,
         deterministic_errors: Vec<SubgraphError>,
-    ) -> Result<Vec<(EntityKey, Vid)>, StoreError>;
+    ) -> Result<(), StoreError>;
 
     /// Look up multiple entities as of the latest block. Returns a map of
     /// entities by type.
     fn get_many(
         &self,
         ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
-    ) -> Result<BTreeMap<EntityType, Vec<EntityVersion>>, StoreError>;
+    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError>;
 
     /// The deployment `id` finished syncing, mark it as synced in the database
     /// and promote it to the current version in the subgraphs where it was the
@@ -1101,7 +1108,7 @@ mock! {
         fn get_many_mock<'a>(
             &self,
             _ids_for_type: BTreeMap<&'a EntityType, Vec<&'a str>>,
-        ) -> Result<BTreeMap<EntityType, Vec<EntityVersion>>, StoreError>;
+        ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError>;
     }
 }
 
@@ -1224,7 +1231,7 @@ impl WritableStore for MockStore {
         unimplemented!()
     }
 
-    fn get(&self, _: &EntityKey) -> Result<Option<EntityVersion>, StoreError> {
+    fn get(&self, _: &EntityKey) -> Result<Option<Entity>, StoreError> {
         unimplemented!()
     }
 
@@ -1236,14 +1243,14 @@ impl WritableStore for MockStore {
         _: StopwatchMetrics,
         _: Vec<StoredDynamicDataSource>,
         _: Vec<SubgraphError>,
-    ) -> Result<Vec<(EntityKey, Vid)>, StoreError> {
+    ) -> Result<(), StoreError> {
         unimplemented!()
     }
 
     fn get_many(
         &self,
         ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
-    ) -> Result<BTreeMap<EntityType, Vec<EntityVersion>>, StoreError> {
+    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
         self.get_many_mock(ids_for_type)
     }
 
@@ -1316,6 +1323,21 @@ pub trait ChainStore: Send + Sync + 'static {
     ///
     /// The head block pointer will be None on initial set up.
     fn chain_head_ptr(&self) -> Result<Option<BlockPtr>, Error>;
+
+    /// Get the current head block cursor for this chain.
+    ///
+    /// The head block cursor will be None on initial set up.
+    fn chain_head_cursor(&self) -> Result<Option<String>, Error>;
+
+    /// This method does actually three operations:
+    /// - Upserts received block into blocks table
+    /// - Update chain head block into networks table
+    /// - Update chain head cursor into networks table
+    async fn set_chain_head(
+        self: Arc<Self>,
+        block: Arc<dyn Block>,
+        cursor: String,
+    ) -> Result<(), Error>;
 
     /// Returns the blocks present in the store.
     fn blocks(&self, hashes: &[H256]) -> Result<Vec<serde_json::Value>, Error>;
@@ -1457,20 +1479,16 @@ pub enum EntityModification {
     /// Insert the entity
     Insert { key: EntityKey, data: Entity },
     /// Update the entity by overwriting it
-    Overwrite {
-        key: EntityKey,
-        data: Entity,
-        prev_vid: Vid,
-    },
+    Overwrite { key: EntityKey, data: Entity },
     /// Remove the entity
-    Remove { key: EntityKey, prev_vid: Vid },
+    Remove { key: EntityKey },
 }
 
 impl EntityModification {
     pub fn entity_key(&self) -> &EntityKey {
         use EntityModification::*;
         match self {
-            Insert { key, .. } | Overwrite { key, .. } | Remove { key, .. } => key,
+            Insert { key, .. } | Overwrite { key, .. } | Remove { key } => key,
         }
     }
 
@@ -1533,7 +1551,7 @@ impl EntityOp {
 pub struct EntityCache {
     /// The state of entities in the store. An entry of `None`
     /// means that the entity is not present in the store
-    current: LfuCache<EntityKey, Option<EntityVersion>>,
+    current: LfuCache<EntityKey, Option<Entity>>,
 
     /// The accumulated changes to an entity.
     updates: HashMap<EntityKey, EntityOp>,
@@ -1562,7 +1580,7 @@ impl Debug for EntityCache {
 pub struct ModificationsAndCache {
     pub modifications: Vec<EntityModification>,
     pub data_sources: Vec<StoredDynamicDataSource>,
-    pub entity_lfu_cache: LfuCache<EntityKey, Option<EntityVersion>>,
+    pub entity_lfu_cache: LfuCache<EntityKey, Option<Entity>>,
 }
 
 impl EntityCache {
@@ -1579,7 +1597,7 @@ impl EntityCache {
 
     pub fn with_current(
         store: Arc<dyn WritableStore>,
-        current: LfuCache<EntityKey, Option<EntityVersion>>,
+        current: LfuCache<EntityKey, Option<Entity>>,
     ) -> EntityCache {
         EntityCache {
             current,
@@ -1615,10 +1633,7 @@ impl EntityCache {
 
     pub fn get(&mut self, key: &EntityKey) -> Result<Option<Entity>, QueryExecutionError> {
         // Get the current entity, apply any updates from `updates`, then from `handler_updates`.
-        let mut entity = self
-            .current
-            .get_entity(&*self.store, key)?
-            .map(|ev| ev.data);
+        let mut entity = self.current.get_entity(&*self.store, key)?;
         if let Some(op) = self.updates.get(key).cloned() {
             entity = op.apply_to(entity)
         }
@@ -1708,14 +1723,14 @@ impl EntityCache {
         }
 
         for (subgraph_id, keys) in missing_by_subgraph {
-            for (entity_type, evs) in self.store.get_many(keys)? {
-                for ev in evs {
+            for (entity_type, entities) in self.store.get_many(keys)? {
+                for entity in entities {
                     let key = EntityKey {
                         subgraph_id: subgraph_id.clone(),
                         entity_type: entity_type.clone(),
-                        entity_id: ev.data.id().unwrap(),
+                        entity_id: entity.id().unwrap(),
                     };
-                    self.current.insert(key, Some(ev));
+                    self.current.insert(key, Some(entity));
                 }
             }
         }
@@ -1730,47 +1745,33 @@ impl EntityCache {
                     // Merging with an empty entity removes null fields.
                     let mut data = Entity::new();
                     data.merge_remove_null_fields(updates);
-                    let ev = EntityVersion::new(data.clone(), None);
-                    self.current.insert(key.clone(), Some(ev));
+                    self.current.insert(key.clone(), Some(data.clone()));
                     Some(Insert { key, data })
                 }
                 // Entity may have been changed
                 (Some(current), EntityOp::Update(updates)) => {
-                    let mut data = current.data.clone();
+                    let mut data = current.clone();
                     data.merge_remove_null_fields(updates);
-                    let ev = EntityVersion::new(data.clone(), current.vid);
-                    self.current.insert(key.clone(), Some(ev));
-                    if current.data != data {
-                        Some(Overwrite {
-                            key,
-                            data,
-                            prev_vid: current.vid,
-                        })
+                    self.current.insert(key.clone(), Some(data.clone()));
+                    if current != data {
+                        Some(Overwrite { key, data })
                     } else {
                         None
                     }
                 }
                 // Entity was removed and then updated, so it will be overwritten
                 (Some(current), EntityOp::Overwrite(data)) => {
-                    let ev = EntityVersion::new(data.clone(), current.vid);
-                    self.current.insert(key.clone(), Some(ev));
-                    if current.data != data {
-                        Some(Overwrite {
-                            key,
-                            data,
-                            prev_vid: current.vid,
-                        })
+                    self.current.insert(key.clone(), Some(data.clone()));
+                    if current != data {
+                        Some(Overwrite { key, data })
                     } else {
                         None
                     }
                 }
                 // Existing entity was deleted
-                (Some(current), EntityOp::Remove) => {
+                (Some(_), EntityOp::Remove) => {
                     self.current.insert(key.clone(), None);
-                    Some(Remove {
-                        key,
-                        prev_vid: current.vid,
-                    })
+                    Some(Remove { key })
                 }
                 // Entity was deleted, but it doesn't exist in the store
                 (None, EntityOp::Remove) => None,
@@ -1787,37 +1788,24 @@ impl EntityCache {
     }
 }
 
-impl LfuCache<EntityKey, Option<EntityVersion>> {
+impl LfuCache<EntityKey, Option<Entity>> {
     // Helper for cached lookup of an entity.
     fn get_entity(
         &mut self,
         store: &(impl WritableStore + ?Sized),
         key: &EntityKey,
-    ) -> Result<Option<EntityVersion>, QueryExecutionError> {
+    ) -> Result<Option<Entity>, QueryExecutionError> {
         match self.get(key) {
             None => {
                 let mut entity = store.get(key)?;
                 if let Some(entity) = &mut entity {
                     // `__typename` is for queries not for mappings.
-                    entity.data.remove("__typename");
+                    entity.remove("__typename");
                 }
                 self.insert(key.clone(), entity.clone());
                 Ok(entity)
             }
             Some(data) => Ok(data.to_owned()),
-        }
-    }
-
-    /// Update the `vid` of cached entities to reflect changes made in the
-    /// database. When entities stay cached across insert/update operations,
-    /// their vid in the database changes as a result of these operations
-    /// and needs to be updated
-    pub fn update_vids(&mut self, vid_map: Vec<(EntityKey, Vid)>) {
-        for (key, vid) in vid_map {
-            assert!(vid.is_some());
-            if let Some(Some(x)) = self.get_mut(key) {
-                x.vid = vid;
-            }
         }
     }
 }
