@@ -7,7 +7,6 @@ use graph::data::subgraph::UnifiedMappingApiVersion;
 use graph::prelude::ethabi::ParamType;
 use graph::prelude::ethabi::Token;
 use graph::prelude::tokio::try_join;
-use graph::prelude::StopwatchMetrics;
 use graph::{
     blockchain::{block_stream::BlockWithTriggers, BlockPtr, IngestorError},
     prelude::{
@@ -18,8 +17,8 @@ use graph::{
         web3::{
             self,
             types::{
-                Address, Block, BlockId, BlockNumber as Web3BlockNumber, Bytes, CallRequest,
-                Filter, FilterBuilder, Log, Transaction, TransactionReceipt, H256,
+                Address, BlockId, BlockNumber as Web3BlockNumber, Bytes, CallRequest, Filter,
+                FilterBuilder, Log, Transaction, TransactionReceipt, H256,
             },
         },
         BlockNumber, ChainStore, CheapClone, DynTryFuture, Error, EthereumCallCache, Logger,
@@ -33,7 +32,6 @@ use graph::{
     prelude::web3::types::{Trace, TraceFilter, TraceFilterBuilder, H160},
 };
 use itertools::Itertools;
-use lazy_static::lazy_static;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::TryFrom;
 use std::iter::FromIterator;
@@ -50,7 +48,7 @@ use crate::{
     },
     transport::Transport,
     trigger::{EthereumBlockTriggerType, EthereumTrigger},
-    TriggerFilter,
+    TriggerFilter, ENV_VARS,
 };
 
 #[derive(Clone)]
@@ -62,63 +60,6 @@ pub struct EthereumAdapter {
     web3: Arc<Web3<Transport>>,
     metrics: Arc<ProviderEthRpcMetrics>,
     supports_eip_1898: bool,
-}
-
-lazy_static! {
-    static ref TRACE_STREAM_STEP_SIZE: BlockNumber = std::env::var("ETHEREUM_TRACE_STREAM_STEP_SIZE")
-        .unwrap_or("50".into())
-        .parse::<BlockNumber>()
-        .expect("invalid trace stream step size");
-
-    /// Maximum range size for `eth.getLogs` requests that dont filter on
-    /// contract address, only event signature, and are therefore expensive.
-    ///
-    /// According to Ethereum node operators, size 500 is reasonable here.
-    static ref MAX_EVENT_ONLY_RANGE: BlockNumber = std::env::var("GRAPH_ETHEREUM_MAX_EVENT_ONLY_RANGE")
-        .unwrap_or("500".into())
-        .parse::<BlockNumber>()
-        .expect("invalid number of parallel Ethereum block ranges to scan");
-
-    static ref BLOCK_BATCH_SIZE: usize = std::env::var("ETHEREUM_BLOCK_BATCH_SIZE")
-            .unwrap_or("10".into())
-            .parse::<usize>()
-            .expect("invalid ETHEREUM_BLOCK_BATCH_SIZE env var");
-
-    /// This should not be too large that it causes requests to timeout without us catching it, nor
-    /// too small that it causes us to timeout requests that would've succeeded. We've seen
-    /// successful `eth_getLogs` requests take over 120 seconds.
-    static ref JSON_RPC_TIMEOUT: u64 = std::env::var("GRAPH_ETHEREUM_JSON_RPC_TIMEOUT")
-            .unwrap_or("180".into())
-            .parse::<u64>()
-            .expect("invalid GRAPH_ETHEREUM_JSON_RPC_TIMEOUT env var");
-
-
-    /// This is used for requests that will not fail the subgraph if the limit is reached, but will
-    /// simply restart the syncing step, so it can be low. This limit guards against scenarios such
-    /// as requesting a block hash that has been reorged.
-    static ref REQUEST_RETRIES: usize = std::env::var("GRAPH_ETHEREUM_REQUEST_RETRIES")
-            .unwrap_or("10".into())
-            .parse::<usize>()
-            .expect("invalid GRAPH_ETHEREUM_REQUEST_RETRIES env var");
-
-    /// Additional deterministic errors that have not yet been hardcoded. Separated by `;`.
-    static ref GETH_ETH_CALL_ERRORS_ENV: Vec<String> = {
-        std::env::var("GRAPH_GETH_ETH_CALL_ERRORS")
-        .map(|s| s.split(';').filter(|s| s.len() > 0).map(ToOwned::to_owned).collect())
-        .unwrap_or(Vec::new())
-    };
-
-    static ref MAX_CONCURRENT_JSON_RPC_CALLS: usize = std::env::var(
-        "GRAPH_ETHEREUM_BLOCK_INGESTOR_MAX_CONCURRENT_JSON_RPC_CALLS_FOR_TXN_RECEIPTS"
-    )
-        .unwrap_or("1000".into())
-        .parse::<usize>()
-        .expect("invalid GRAPH_ETHEREUM_BLOCK_INGESTOR_MAX_CONCURRENT_JSON_RPC_CALLS_FOR_TXN_RECEIPTS env var");
-
-    static ref FETCH_RECEIPTS_CONCURRENTLY: bool = std::env::var("GRAPH_EXPERIMENTAL_FETCH_TXN_RECEIPTS_CONCURRENTLY")
-            .is_ok();
-
-
 }
 
 /// Gas limit for `eth_call`. The value of 50_000_000 is a protocol-wide parameter so this
@@ -190,10 +131,11 @@ impl EthereumAdapter {
         addresses: Vec<H160>,
     ) -> Result<Vec<Trace>, Error> {
         let eth = self.clone();
-
-        retry("trace_filter RPC call", &logger)
-            .limit(*REQUEST_RETRIES)
-            .timeout_secs(*JSON_RPC_TIMEOUT)
+        let retry_log_message =
+            format!("trace_filter RPC call for block range: [{}..{}]", from, to);
+        retry(retry_log_message, &logger)
+            .limit(ENV_VARS.request_retries)
+            .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
             .run(move || {
                 let trace_filter: TraceFilter = match addresses.len() {
                     0 => TraceFilterBuilder::default()
@@ -247,15 +189,12 @@ impl EthereumAdapter {
                     let elapsed = start.elapsed().as_secs_f64();
                     provider_metrics.observe_request(elapsed, "trace_filter", &provider);
                     subgraph_metrics.observe_request(elapsed, "trace_filter", &provider);
-                    if result.is_err() {
+                    if let Err(e) = &result {
                         provider_metrics.add_error("trace_filter", &provider);
                         subgraph_metrics.add_error("trace_filter", &provider);
                         debug!(
                             logger_for_error,
-                            "Error querying traces error = {:?} from = {:?} to = {:?}",
-                            result,
-                            from,
-                            to
+                            "Error querying traces error = {:#} from = {} to = {}", e, from, to
                         );
                     }
                     result
@@ -284,16 +223,16 @@ impl EthereumAdapter {
         too_many_logs_fingerprints: &'static [&'static str],
     ) -> Result<Vec<Log>, TimeoutError<web3::error::Error>> {
         let eth_adapter = self.clone();
-
-        retry("eth_getLogs RPC call", &logger)
+        let retry_log_message = format!("eth_getLogs RPC call for block range: [{}..{}]", from, to);
+        retry(retry_log_message, &logger)
             .when(move |res: &Result<_, web3::error::Error>| match res {
                 Ok(_) => false,
                 Err(e) => !too_many_logs_fingerprints
                     .iter()
                     .any(|f| e.to_string().contains(f)),
             })
-            .limit(*REQUEST_RETRIES)
-            .timeout_secs(*JSON_RPC_TIMEOUT)
+            .limit(ENV_VARS.request_retries)
+            .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
             .run(move || {
                 let eth_adapter = eth_adapter.cheap_clone();
                 let subgraph_metrics = subgraph_metrics.clone();
@@ -342,7 +281,7 @@ impl EthereumAdapter {
             );
         }
 
-        let step_size = *TRACE_STREAM_STEP_SIZE;
+        let step_size = ENV_VARS.trace_stream_step_size;
 
         let eth = self.clone();
         let logger = logger.to_owned();
@@ -371,7 +310,7 @@ impl EthereumAdapter {
                 new_start,
             )))
         })
-        .buffered(*BLOCK_BATCH_SIZE)
+        .buffered(ENV_VARS.block_batch_size)
         .map(stream::iter_ok)
         .flatten()
     }
@@ -406,7 +345,7 @@ impl EthereumAdapter {
         let step = match filter.contracts.is_empty() {
             // `to - from + 1`  blocks will be scanned.
             false => to - from,
-            true => (to - from).min(*MAX_EVENT_ONLY_RANGE - 1),
+            true => (to - from).min(ENV_VARS.max_event_only_range - 1),
         };
 
         // Typically this will loop only once and fetch the entire range in one request. But if the
@@ -485,26 +424,30 @@ impl EthereumAdapter {
         } else {
             BlockId::Hash(block_ptr.hash_as_h256())
         };
-
-        retry("eth_call RPC call", &logger)
+        let retry_log_message = format!("eth_call RPC call for block {}", block_ptr);
+        retry(retry_log_message, &logger)
             .when(|result| match result {
                 Ok(_) | Err(EthereumContractCallError::Revert(_)) => false,
                 Err(_) => true,
             })
-            .limit(*REQUEST_RETRIES)
-            .timeout_secs(*JSON_RPC_TIMEOUT)
+            .limit(ENV_VARS.request_retries)
+            .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
             .run(move || {
                 let call_data = call_data.clone();
                 let web3 = web3.cheap_clone();
 
                 async move {
                     let req = CallRequest {
-                        from: None,
                         to: Some(contract_address),
                         gas: Some(web3::types::U256::from(ETH_CALL_GAS)),
+                        data: Some(call_data.clone()),
+                        from: None,
                         gas_price: None,
                         value: None,
-                        data: Some(call_data.clone()),
+                        access_list: None,
+                        max_fee_per_gas: None,
+                        max_priority_fee_per_gas: None,
+                        transaction_type: None,
                     };
                     let result = web3.eth().call(req, Some(block_id)).boxed().await;
 
@@ -546,10 +489,11 @@ impl EthereumAdapter {
                         "out of gas",
                     ];
 
+                    let env_geth_call_errors = ENV_VARS.geth_eth_call_errors.iter();
                     let mut geth_execution_errors = GETH_EXECUTION_ERRORS
                         .iter()
                         .map(|s| *s)
-                        .chain(GETH_ETH_CALL_ERRORS_ENV.iter().map(|s| s.as_str()));
+                        .chain(env_geth_call_errors.map(|s| s.as_str()));
 
                     let as_solidity_revert_with_reason = |bytes: &[u8]| {
                         let solidity_revert_function_selector =
@@ -630,8 +574,8 @@ impl EthereumAdapter {
         stream::iter_ok::<_, Error>(ids.into_iter().map(move |hash| {
             let web3 = web3.clone();
             retry(format!("load block {}", hash), &logger)
-                .limit(*REQUEST_RETRIES)
-                .timeout_secs(*JSON_RPC_TIMEOUT)
+                .limit(ENV_VARS.request_retries)
+                .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
                 .run(move || {
                     Box::pin(web3.eth().block_with_txs(BlockId::Hash(hash)))
                         .compat()
@@ -647,7 +591,7 @@ impl EthereumAdapter {
                 .compat()
                 .from_err()
         }))
-        .buffered(*BLOCK_BATCH_SIZE)
+        .buffered(ENV_VARS.block_batch_size)
     }
 
     /// Request blocks ptrs for numbers through JSON-RPC.
@@ -664,7 +608,7 @@ impl EthereumAdapter {
             let web3 = web3.clone();
             retry(format!("load block ptr {}", block_num), &logger)
                 .no_limit()
-                .timeout_secs(*JSON_RPC_TIMEOUT)
+                .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
                 .run(move || {
                     let web3 = web3.clone();
                     async move {
@@ -683,7 +627,7 @@ impl EthereumAdapter {
                 .compat()
                 .from_err()
         }))
-        .buffered(*BLOCK_BATCH_SIZE)
+        .buffered(ENV_VARS.block_batch_size)
         .map(|b| b.into())
     }
 
@@ -732,7 +676,7 @@ impl EthereumAdapter {
             )
         }))
         // Real limits on the number of parallel requests are imposed within the adapter.
-        .buffered(*MAX_CONCURRENT_JSON_RPC_CALLS)
+        .buffered(ENV_VARS.block_ingestor_max_concurrent_json_rpc_calls)
         .try_concat()
         .boxed()
     }
@@ -848,7 +792,7 @@ impl EthereumAdapter {
         u64::try_from(
             retry("chain_id RPC call", &logger)
                 .no_limit()
-                .timeout_secs(*JSON_RPC_TIMEOUT)
+                .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
                 .run(move || {
                     let web3 = web3.cheap_clone();
                     async move { web3.eth().chain_id().await }
@@ -922,7 +866,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         Box::new(
             retry("eth_getBlockByNumber(latest) no txs RPC call", logger)
                 .no_limit()
-                .timeout_secs(*JSON_RPC_TIMEOUT)
+                .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
                 .run(move || {
                     let web3 = web3.cheap_clone();
                     async move {
@@ -956,7 +900,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         Box::new(
             retry("eth_getBlockByNumber(latest) with txs RPC call", logger)
                 .no_limit()
-                .timeout_secs(*JSON_RPC_TIMEOUT)
+                .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
                 .run(move || {
                     let web3 = web3.cheap_clone();
                     async move {
@@ -1006,11 +950,14 @@ impl EthereumAdapterTrait for EthereumAdapter {
     ) -> Box<dyn Future<Item = Option<LightEthereumBlock>, Error = Error> + Send> {
         let web3 = self.web3.clone();
         let logger = logger.clone();
-
+        let retry_log_message = format!(
+            "eth_getBlockByHash RPC call for block hash {:?}",
+            block_hash
+        );
         Box::new(
-            retry("eth_getBlockByHash RPC call", &logger)
-                .limit(*REQUEST_RETRIES)
-                .timeout_secs(*JSON_RPC_TIMEOUT)
+            retry(retry_log_message, &logger)
+                .limit(ENV_VARS.request_retries)
+                .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
                 .run(move || {
                     Box::pin(web3.eth().block_with_txs(BlockId::Hash(block_hash)))
                         .compat()
@@ -1034,11 +981,14 @@ impl EthereumAdapterTrait for EthereumAdapter {
     ) -> Box<dyn Future<Item = Option<LightEthereumBlock>, Error = Error> + Send> {
         let web3 = self.web3.clone();
         let logger = logger.clone();
-
+        let retry_log_message = format!(
+            "eth_getBlockByNumber RPC call for block number {}",
+            block_number
+        );
         Box::new(
-            retry("eth_getBlockByNumber RPC call", &logger)
+            retry(retry_log_message, &logger)
                 .no_limit()
-                .timeout_secs(*JSON_RPC_TIMEOUT)
+                .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
                 .run(move || {
                     let web3 = web3.cheap_clone();
                     async move {
@@ -1080,14 +1030,11 @@ impl EthereumAdapterTrait for EthereumAdapter {
                 transaction_receipts: Vec::new(),
             })));
         }
-
-        let hashes: Vec<_> = block
-            .transactions
-            .iter()
-            .map(|txn| txn.hash.clone())
-            .collect();
-
-        let receipts_future = if *FETCH_RECEIPTS_CONCURRENTLY {
+        let hashes: Vec<_> = block.transactions.iter().map(|txn| txn.hash).collect();
+        let receipts_future = if ENV_VARS.fetch_receipts_in_batches {
+            // Deprecated batching retrieval of transaction receipts.
+            fetch_transaction_receipts_in_batch_with_retry(web3, hashes, block_hash, logger).boxed()
+        } else {
             let hash_stream = graph::tokio_stream::iter(hashes);
             let receipt_stream = graph::tokio_stream::StreamExt::map(hash_stream, move |tx_hash| {
                 fetch_transaction_receipt_with_retry(
@@ -1097,13 +1044,10 @@ impl EthereumAdapterTrait for EthereumAdapter {
                     logger.cheap_clone(),
                 )
             })
-            .buffered(*MAX_CONCURRENT_JSON_RPC_CALLS);
+            .buffered(ENV_VARS.block_ingestor_max_concurrent_json_rpc_calls);
             graph::tokio_stream::StreamExt::collect::<Result<Vec<TransactionReceipt>, IngestorError>>(
                 receipt_stream,
             ).boxed()
-        } else {
-            // Deprecated batching retrieval of transaction receipts.
-            fetch_transaction_receipts_in_batch_with_retry(web3, hashes, block_hash, logger).boxed()
         };
 
         let block_future =
@@ -1143,11 +1087,14 @@ impl EthereumAdapterTrait for EthereumAdapter {
         block_number: BlockNumber,
     ) -> Box<dyn Future<Item = Option<H256>, Error = Error> + Send> {
         let web3 = self.web3.clone();
-
+        let retry_log_message = format!(
+            "eth_getBlockByNumber RPC call for block number {}",
+            block_number
+        );
         Box::new(
-            retry("eth_getBlockByNumber RPC call", &logger)
+            retry(retry_log_message, &logger)
                 .no_limit()
-                .timeout_secs(*JSON_RPC_TIMEOUT)
+                .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
                 .run(move || {
                     let web3 = web3.cheap_clone();
                     async move {
@@ -1168,58 +1115,6 @@ impl EthereumAdapterTrait for EthereumAdapter {
                         )
                     })
                 }),
-        )
-    }
-
-    fn uncles(
-        &self,
-        logger: &Logger,
-        block: &LightEthereumBlock,
-    ) -> Box<dyn Future<Item = Vec<Option<Block<H256>>>, Error = Error> + Send> {
-        let block_hash = match block.hash {
-            Some(hash) => hash,
-            None => {
-                return Box::new(future::result(Err(anyhow!(
-                    "could not get uncle for block '{}' because block has null hash",
-                    block
-                        .number
-                        .map(|num| num.to_string())
-                        .unwrap_or(String::from("null"))
-                ))))
-            }
-        };
-        let n = block.uncles.len();
-
-        Box::new(
-            futures::stream::futures_ordered((0..n).map(move |index| {
-                let web3 = self.web3.clone();
-
-                retry("eth_getUncleByBlockHashAndIndex RPC call", &logger)
-                    .no_limit()
-                    .timeout_secs(60)
-                    .run(move || {
-                        Box::pin(web3.eth().uncle(block_hash.clone().into(), index.into()))
-                            .compat()
-                            .map_err(move |e| {
-                                anyhow!(
-                                    "could not get uncle {} for block {:?} ({} uncles): {}",
-                                    index,
-                                    block_hash,
-                                    n,
-                                    e
-                                )
-                            })
-                            .compat()
-                    })
-                    .map_err(move |e| {
-                        e.into_inner().unwrap_or_else(move || {
-                            anyhow!("Ethereum node took too long to return uncle")
-                        })
-                    })
-                    .boxed()
-                    .compat()
-            }))
-            .collect(),
         )
     }
 
@@ -1378,7 +1273,6 @@ pub(crate) async fn blocks_with_triggers(
     logger: Logger,
     chain_store: Arc<dyn ChainStore>,
     subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
-    stopwatch_metrics: StopwatchMetrics,
     from: BlockNumber,
     to: BlockNumber,
     filter: &TriggerFilter,
@@ -1495,8 +1389,8 @@ pub(crate) async fn blocks_with_triggers(
                     triggers,
                 )),
                 None => Err(anyhow!(
-                    "block {:?} not found in `triggers_by_block`",
-                    block
+                    "block {} not found in `triggers_by_block`",
+                    block.block_ptr()
                 )),
             },
         )
@@ -1509,14 +1403,10 @@ pub(crate) async fn blocks_with_triggers(
     let mut blocks = if unified_api_version
         .equal_or_greater_than(&graph::data::subgraph::API_VERSION_0_0_5)
     {
-        let section =
-            stopwatch_metrics.start_section("filter_call_triggers_from_unsuccessful_transactions");
         let futures = blocks.into_iter().map(|block| {
             filter_call_triggers_from_unsuccessful_transactions(block, &eth, &chain_store, &logger)
         });
-        let blocks = futures03::future::try_join_all(futures).await?;
-        section.end();
-        blocks
+        futures03::future::try_join_all(futures).await?
     } else {
         blocks
     };
@@ -1703,6 +1593,11 @@ async fn filter_call_triggers_from_unsuccessful_transactions(
             "failed to obtain transaction hash from call triggers"
         ))?;
 
+    // Return early if there are no transaction hashes
+    if transaction_hashes.is_empty() {
+        return Ok(block);
+    }
+
     // And obtain all Transaction values for the calls in this block.
     let transactions: Vec<&Transaction> = {
         match &block.block {
@@ -1722,11 +1617,6 @@ async fn filter_call_triggers_from_unsuccessful_transactions(
     // Confidence check: Did we collect all transactions for the current call triggers?
     if transactions.len() != transaction_hashes.len() {
         bail!("failed to find transactions in block for the given call triggers")
-    }
-
-    // Return early if there are no transactions to inspect
-    if transactions.is_empty() {
-        return Ok(block);
     }
 
     // We'll also need the receipts for those transactions. In this step we collect all receipts
@@ -1820,10 +1710,14 @@ async fn fetch_transaction_receipts_in_batch_with_retry(
     block_hash: H256,
     logger: Logger,
 ) -> Result<Vec<TransactionReceipt>, IngestorError> {
-    retry("batch eth_getTransactionReceipt RPC call", &logger)
-        .limit(*REQUEST_RETRIES)
+    let retry_log_message = format!(
+        "batch eth_getTransactionReceipt RPC call for block {:?}",
+        block_hash
+    );
+    retry(retry_log_message, &logger)
+        .limit(ENV_VARS.request_retries)
         .no_logging()
-        .timeout_secs(*JSON_RPC_TIMEOUT)
+        .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
         .run(move || {
             let web3 = web3.cheap_clone();
             let hashes = hashes.clone();
@@ -1842,13 +1736,12 @@ async fn fetch_transaction_receipts_in_batch(
     logger: Logger,
 ) -> Result<Vec<TransactionReceipt>, IngestorError> {
     let batching_web3 = Web3::new(Batch::new(web3.transport().clone()));
+    let eth = batching_web3.eth();
     let receipt_futures = hashes
         .into_iter()
-        .map(|hash| {
+        .map(move |hash| {
             let logger = logger.cheap_clone();
-            batching_web3
-                .eth()
-                .transaction_receipt(hash.clone())
+            eth.transaction_receipt(hash)
                 .map_err(|web3_error| IngestorError::from(web3_error))
                 .and_then(move |some_receipt| async move {
                     resolve_transaction_receipt(some_receipt, hash, block_hash, logger)
@@ -1873,10 +1766,13 @@ async fn fetch_transaction_receipt_with_retry(
     logger: Logger,
 ) -> Result<TransactionReceipt, IngestorError> {
     let logger = logger.cheap_clone();
-    retry("batch eth_getTransactionReceipt RPC call", &logger)
-        .limit(*REQUEST_RETRIES)
-        .no_logging()
-        .timeout_secs(*JSON_RPC_TIMEOUT)
+    let retry_log_message = format!(
+        "eth_getTransactionReceipt RPC call for transaction {:?}",
+        transaction_hash
+    );
+    retry(retry_log_message, &logger)
+        .limit(ENV_VARS.request_retries)
+        .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
         .run(move || web3.eth().transaction_receipt(transaction_hash).boxed())
         .await
         .map_err(|_timeout| anyhow!(block_hash).into())

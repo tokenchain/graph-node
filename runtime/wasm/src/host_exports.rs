@@ -1,29 +1,29 @@
-use crate::{error::DeterminismLevel, module::IntoTrap};
-use ethabi::param_type::Reader;
-use ethabi::{decode, encode, Token};
-use graph::blockchain::DataSource;
-use graph::blockchain::{Blockchain, DataSourceTemplate as _};
-use graph::components::store::EntityKey;
-use graph::components::store::EntityType;
-use graph::components::subgraph::{CausalityRegion, ProofOfIndexingEvent, SharedProofOfIndexing};
-use graph::data::store;
-use graph::prelude::serde_json;
-use graph::prelude::{slog::b, slog::record_static, *};
-use graph::runtime::gas::{self, complexity, Gas, GasCounter};
-pub use graph::runtime::{DeterministicHostError, HostExportError};
-use never::Never;
-use semver::Version;
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
+
+use never::Never;
+use semver::Version;
+use wasmtime::Trap;
 use web3::types::H160;
 
+use graph::blockchain::DataSource;
+use graph::blockchain::{Blockchain, DataSourceTemplate as _};
+use graph::components::store::EntityType;
+use graph::components::store::{EnsLookup, EntityKey};
+use graph::components::subgraph::{CausalityRegion, ProofOfIndexingEvent, SharedProofOfIndexing};
+use graph::data::store;
 use graph::ensure;
-use graph_graphql::prelude::validate_entity;
-use wasmtime::Trap;
+use graph::prelude::ethabi::param_type::Reader;
+use graph::prelude::ethabi::{decode, encode, Token};
+use graph::prelude::serde_json;
+use graph::prelude::{slog::b, slog::record_static, *};
+use graph::runtime::gas::{self, complexity, Gas, GasCounter};
+pub use graph::runtime::{DeterministicHostError, HostExportError};
 
 use crate::module::{WasmInstance, WasmInstanceContext};
+use crate::{error::DeterminismLevel, module::IntoTrap};
 
 fn write_poi_event(
     proof_of_indexing: &SharedProofOfIndexing,
@@ -68,7 +68,7 @@ pub struct HostExports<C: Blockchain> {
     causality_region: String,
     templates: Arc<Vec<C::DataSourceTemplate>>,
     pub(crate) link_resolver: Arc<dyn LinkResolver>,
-    store: Arc<dyn SubgraphStore>,
+    ens_lookup: Arc<dyn EnsLookup>,
 }
 
 impl<C: Blockchain> HostExports<C> {
@@ -78,7 +78,7 @@ impl<C: Blockchain> HostExports<C> {
         data_source_network: String,
         templates: Arc<Vec<C::DataSourceTemplate>>,
         link_resolver: Arc<dyn LinkResolver>,
-        store: Arc<dyn SubgraphStore>,
+        ens_lookup: Arc<dyn EnsLookup>,
     ) -> Self {
         Self {
             subgraph_id,
@@ -90,7 +90,7 @@ impl<C: Blockchain> HostExports<C> {
             data_source_network,
             templates,
             link_resolver,
-            store,
+            ens_lookup,
         }
     }
 
@@ -119,7 +119,7 @@ impl<C: Blockchain> HostExports<C> {
             ),
             _ => unreachable!(),
         };
-        Err(DeterministicHostError(anyhow::anyhow!(
+        Err(DeterministicHostError::from(anyhow::anyhow!(
             "Mapping aborted at {}, with {}",
             location,
             message
@@ -133,7 +133,7 @@ impl<C: Blockchain> HostExports<C> {
         proof_of_indexing: &SharedProofOfIndexing,
         entity_type: String,
         entity_id: String,
-        mut data: HashMap<String, Value>,
+        data: HashMap<String, Value>,
         stopwatch: &StopwatchMetrics,
         gas: &GasCounter,
     ) -> Result<(), anyhow::Error> {
@@ -150,23 +150,6 @@ impl<C: Blockchain> HostExports<C> {
         );
         poi_section.end();
 
-        let id_insert_section = stopwatch.start_section("host_export_store_set__insert_id");
-        // Automatically add an "id" value
-        match data.insert("id".to_string(), Value::String(entity_id.clone())) {
-            Some(ref v) if v != &Value::String(entity_id.clone()) => {
-                return Err(anyhow!(
-                    "Value of {} attribute 'id' conflicts with ID passed to `store.set()`: \
-                     {} != {}",
-                    entity_type,
-                    v,
-                    entity_id,
-                ));
-            }
-            _ => (),
-        }
-
-        id_insert_section.end();
-        let validation_section = stopwatch.start_section("host_export_store_set__validation");
         let key = EntityKey {
             subgraph_id: self.subgraph_id.clone(),
             entity_type: EntityType::new(entity_type),
@@ -176,22 +159,8 @@ impl<C: Blockchain> HostExports<C> {
         gas.consume_host_fn(gas::STORE_SET.with_args(complexity::Linear, (&key, &data)))?;
 
         let entity = Entity::from(data);
-        let schema = self.store.input_schema(&self.subgraph_id)?;
-        let is_valid = validate_entity(&schema.document, &key, &entity).is_ok();
-        state.entity_cache.set(key.clone(), entity);
+        state.entity_cache.set(key.clone(), entity)?;
 
-        validation_section.end();
-        // Validate the changes against the subgraph schema.
-        // If the set of fields we have is already valid, avoid hitting the DB.
-        if !is_valid {
-            stopwatch.start_section("host_export_store_set__post_validation");
-            let entity = state
-                .entity_cache
-                .get(&key)
-                .map_err(|e| HostExportError::Unknown(e.into()))?
-                .expect("we just stored this entity");
-            validate_entity(&schema.document, &key, &entity)?;
-        }
         Ok(())
     }
 
@@ -235,14 +204,14 @@ impl<C: Blockchain> HostExports<C> {
     ) -> Result<Option<Entity>, anyhow::Error> {
         let store_key = EntityKey {
             subgraph_id: self.subgraph_id.clone(),
-            entity_type: EntityType::new(entity_type.clone()),
-            entity_id: entity_id.clone(),
+            entity_type: EntityType::new(entity_type),
+            entity_id,
         };
 
         let result = state.entity_cache.get(&store_key)?;
         gas.consume_host_fn(gas::STORE_GET.with_args(complexity::Linear, (&store_key, &result)))?;
 
-        Ok(state.entity_cache.get(&store_key)?)
+        Ok(result)
     }
 
     /// Prints the module of `n` in hex.
@@ -272,7 +241,7 @@ impl<C: Blockchain> HostExports<C> {
         // Does not consume gas because this is not a part of the deterministic feature set.
         // Ideally this would first consume gas for fetching the file stats, and then again
         // for the bytes of the file.
-        block_on03(self.link_resolver.cat(logger, &Link { link }))
+        graph::block_on(self.link_resolver.cat(logger, &Link { link }))
     }
 
     // Read the IPFS file `link`, split it into JSON objects, and invoke the
@@ -316,9 +285,9 @@ impl<C: Blockchain> HostExports<C> {
 
         let result = {
             let mut stream: JsonValueStream =
-                block_on03(link_resolver.json_stream(&logger, &Link { link }))?;
+                graph::block_on(link_resolver.json_stream(&logger, &Link { link }))?;
             let mut v = Vec::new();
-            while let Some(sv) = block_on03(stream.next()) {
+            while let Some(sv) = graph::block_on(stream.next()) {
                 let sv = sv?;
                 let module = WasmInstance::from_valid_module_with_ctx(
                     valid_module.clone(),
@@ -354,7 +323,7 @@ impl<C: Blockchain> HostExports<C> {
         gas.consume_host_fn(gas::DEFAULT_GAS_OP.with_args(complexity::Size, &json))?;
         i64::from_str(&json)
             .with_context(|| format!("JSON `{}` cannot be parsed as i64", json))
-            .map_err(DeterministicHostError)
+            .map_err(DeterministicHostError::from)
     }
 
     /// Expects a decimal string.
@@ -367,7 +336,7 @@ impl<C: Blockchain> HostExports<C> {
 
         u64::from_str(&json)
             .with_context(|| format!("JSON `{}` cannot be parsed as u64", json))
-            .map_err(DeterministicHostError)
+            .map_err(DeterministicHostError::from)
     }
 
     /// Expects a decimal string.
@@ -380,7 +349,7 @@ impl<C: Blockchain> HostExports<C> {
 
         f64::from_str(&json)
             .with_context(|| format!("JSON `{}` cannot be parsed as f64", json))
-            .map_err(DeterministicHostError)
+            .map_err(DeterministicHostError::from)
     }
 
     /// Expects a decimal string.
@@ -393,7 +362,7 @@ impl<C: Blockchain> HostExports<C> {
 
         let big_int = BigInt::from_str(&json)
             .with_context(|| format!("JSON `{}` is not a decimal string", json))
-            .map_err(DeterministicHostError)?;
+            .map_err(DeterministicHostError::from)?;
         Ok(big_int.to_signed_bytes_le())
     }
 
@@ -445,7 +414,7 @@ impl<C: Blockchain> HostExports<C> {
     ) -> Result<BigInt, DeterministicHostError> {
         gas.consume_host_fn(gas::BIG_MATH_GAS_OP.with_args(complexity::Mul, (&x, &y)))?;
         if y == 0.into() {
-            return Err(DeterministicHostError(anyhow!(
+            return Err(DeterministicHostError::from(anyhow!(
                 "attempted to divide BigInt `{}` by zero",
                 x
             )));
@@ -461,7 +430,7 @@ impl<C: Blockchain> HostExports<C> {
     ) -> Result<BigInt, DeterministicHostError> {
         gas.consume_host_fn(gas::BIG_MATH_GAS_OP.with_args(complexity::Mul, (&x, &y)))?;
         if y == 0.into() {
-            return Err(DeterministicHostError(anyhow!(
+            return Err(DeterministicHostError::from(anyhow!(
                 "attempted to calculate the remainder of `{}` with a divisor of zero",
                 x
             )));
@@ -488,7 +457,7 @@ impl<C: Blockchain> HostExports<C> {
         gas.consume_host_fn(gas::DEFAULT_GAS_OP.with_args(complexity::Size, &s))?;
         BigInt::from_str(&s)
             .with_context(|| format!("string is not a BigInt: `{}`", s))
-            .map_err(DeterministicHostError)
+            .map_err(DeterministicHostError::from)
     }
 
     pub(crate) fn big_int_bit_or(
@@ -580,7 +549,7 @@ impl<C: Blockchain> HostExports<C> {
     ) -> Result<BigDecimal, DeterministicHostError> {
         gas.consume_host_fn(gas::BIG_MATH_GAS_OP.with_args(complexity::Mul, (&x, &y)))?;
         if y == 0.into() {
-            return Err(DeterministicHostError(anyhow!(
+            return Err(DeterministicHostError::from(anyhow!(
                 "attempted to divide BigDecimal `{}` by zero",
                 x
             )));
@@ -615,7 +584,7 @@ impl<C: Blockchain> HostExports<C> {
         gas.consume_host_fn(gas::DEFAULT_GAS_OP.with_args(complexity::Size, &s))?;
         BigDecimal::from_str(&s)
             .with_context(|| format!("string  is not a BigDecimal: '{}'", s))
-            .map_err(DeterministicHostError)
+            .map_err(DeterministicHostError::from)
     }
 
     pub(crate) fn data_source_create(
@@ -650,12 +619,12 @@ impl<C: Blockchain> HostExports<C> {
                     self.data_source_name,
                     self.templates
                         .iter()
-                        .map(|template| template.name().clone())
+                        .map(|template| template.name())
                         .collect::<Vec<_>>()
                         .join(", ")
                 )
             })
-            .map_err(DeterministicHostError)?
+            .map_err(DeterministicHostError::from)?
             .clone();
 
         // Remember that we need to create this data source
@@ -670,7 +639,7 @@ impl<C: Blockchain> HostExports<C> {
     }
 
     pub(crate) fn ens_name_by_hash(&self, hash: &str) -> Result<Option<String>, anyhow::Error> {
-        Ok(self.store.find_ens_name(hash)?)
+        Ok(self.ens_lookup.find_name(hash)?)
     }
 
     pub(crate) fn log_log(
@@ -691,7 +660,7 @@ impl<C: Blockchain> HostExports<C> {
         ));
 
         if level == slog::Level::Critical {
-            return Err(DeterministicHostError(anyhow!(
+            return Err(DeterministicHostError::from(anyhow!(
                 "Critical error logged in mapping"
             )));
         }
@@ -732,7 +701,8 @@ impl<C: Blockchain> HostExports<C> {
         gas: &GasCounter,
     ) -> Result<serde_json::Value, DeterministicHostError> {
         gas.consume_host_fn(gas::DEFAULT_GAS_OP.with_args(gas::complexity::Size, &bytes))?;
-        serde_json::from_reader(bytes.as_slice()).map_err(|e| DeterministicHostError(e.into()))
+        serde_json::from_reader(bytes.as_slice())
+            .map_err(|e| DeterministicHostError::from(Error::from(e)))
     }
 
     pub(crate) fn string_to_h160(
@@ -775,8 +745,8 @@ impl<C: Blockchain> HostExports<C> {
     ) -> Result<Token, anyhow::Error> {
         gas.consume_host_fn(gas::DEFAULT_GAS_OP.with_args(complexity::Size, &data))?;
 
-        let param_types = Reader::read(&types)
-            .or_else(|e| Err(anyhow::anyhow!("Failed to read types: {}", e)))?;
+        let param_types =
+            Reader::read(&types).map_err(|e| anyhow::anyhow!("Failed to read types: {}", e))?;
 
         decode(&[param_types], &data)
             // The `.pop().unwrap()` here is ok because we're always only passing one
@@ -787,16 +757,12 @@ impl<C: Blockchain> HostExports<C> {
     }
 }
 
-fn block_on03<T>(future: impl futures03::Future<Output = T> + Send) -> T {
-    graph::block_on(future)
-}
-
 fn string_to_h160(string: &str) -> Result<H160, DeterministicHostError> {
     // `H160::from_str` takes a hex string with no leading `0x`.
     let s = string.trim_start_matches("0x");
     H160::from_str(s)
         .with_context(|| format!("Failed to convert string to Address/H160: '{}'", s))
-        .map_err(DeterministicHostError)
+        .map_err(DeterministicHostError::from)
 }
 
 fn bytes_to_string(logger: &Logger, bytes: Vec<u8>) -> String {
@@ -832,7 +798,7 @@ fn bytes_to_string_is_lossy() {
         "Downcoin WETH-USDT",
         bytes_to_string(
             &graph::log::logger(true),
-            vec![68, 111, 119, 110, 99, 111, 105, 110, 32, 87, 69, 84, 72, 45, 85, 83, 68, 84]
+            vec![68, 111, 119, 110, 99, 111, 105, 110, 32, 87, 69, 84, 72, 45, 85, 83, 68, 84],
         )
     );
 
@@ -843,7 +809,7 @@ fn bytes_to_string_is_lossy() {
             vec![
                 68, 111, 119, 110, 99, 111, 105, 110, 32, 87, 69, 84, 72, 45, 85, 83, 68, 84, 160,
                 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-            ]
+            ],
         )
     )
 }

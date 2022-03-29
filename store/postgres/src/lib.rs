@@ -12,7 +12,6 @@ extern crate diesel_migrations;
 #[macro_use]
 extern crate diesel_derive_enum;
 extern crate fallible_iterator;
-extern crate futures;
 extern crate graph;
 extern crate graph_graphql;
 extern crate graphql_parser;
@@ -35,6 +34,7 @@ mod deployment;
 mod deployment_store;
 mod detail;
 mod dynds;
+mod fork;
 mod functions;
 mod jobs;
 mod jsonb;
@@ -48,6 +48,7 @@ mod store;
 mod store_events;
 mod subgraph_store;
 pub mod transaction_receipt;
+mod writable;
 
 #[cfg(debug_assertions)]
 pub mod layout_for_tests {

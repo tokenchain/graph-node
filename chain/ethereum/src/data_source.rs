@@ -2,6 +2,7 @@ use anyhow::{anyhow, Error};
 use anyhow::{ensure, Context};
 use graph::blockchain::TriggerWithHandler;
 use graph::components::store::StoredDynamicDataSource;
+use graph::prelude::ethabi::ethereum_types::H160;
 use graph::prelude::ethabi::StateMutability;
 use graph::prelude::futures03::future::try_join;
 use graph::prelude::futures03::stream::FuturesOrdered;
@@ -17,7 +18,7 @@ use graph::{
     prelude::{
         async_trait,
         ethabi::{Address, Contract, Event, Function, LogParam, ParamType, RawLog},
-        info, serde_json,
+        info, serde_json, warn,
         web3::types::{Log, Transaction, H256},
         BlockNumber, CheapClone, DataSourceTemplateInfo, Deserialize, EthereumCall,
         LightEthereumBlock, LightEthereumBlockExt, LinkResolver, Logger, TryStreamExt,
@@ -59,7 +60,7 @@ impl blockchain::DataSource<Chain> for DataSource {
     fn match_and_decode(
         &self,
         trigger: &<Chain as Blockchain>::TriggerData,
-        block: Arc<<Chain as Blockchain>::Block>,
+        block: &Arc<<Chain as Blockchain>::Block>,
         logger: &Logger,
     ) -> Result<Option<TriggerWithHandler<Chain>>, Error> {
         let block = block.light_block();
@@ -446,7 +447,7 @@ impl DataSource {
     fn match_and_decode(
         &self,
         trigger: &EthereumTrigger,
-        block: Arc<LightEthereumBlock>,
+        block: &Arc<LightEthereumBlock>,
         logger: &Logger,
     ) -> Result<Option<TriggerWithHandler<Chain>>, Error> {
         if !self.matches_trigger_address(&trigger) {
@@ -464,7 +465,9 @@ impl DataSource {
                     None => return Ok(None),
                 };
                 Ok(Some(TriggerWithHandler::new(
-                    MappingTrigger::Block { block },
+                    MappingTrigger::Block {
+                        block: block.cheap_clone(),
+                    },
                     handler.handler,
                 )))
             }
@@ -553,6 +556,7 @@ impl DataSource {
                         block_hash: block.hash,
                         block_number: block.number,
                         transaction_index: log.transaction_index,
+                        from: Some(H160::zero()),
                         ..Transaction::default()
                     }
                 };
@@ -560,10 +564,11 @@ impl DataSource {
                 let logging_extras = Arc::new(o! {
                     "signature" => event_handler.event.to_string(),
                     "address" => format!("{}", &log.address),
+                    "transaction" => format!("{}", &transaction.hash),
                 });
                 Ok(Some(TriggerWithHandler::new_with_logging_extras(
                     MappingTrigger::Log {
-                        block,
+                        block: block.cheap_clone(),
                         transaction: Arc::new(transaction),
                         log: log.cheap_clone(),
                         params,
@@ -597,15 +602,21 @@ impl DataSource {
                 // Take the input for the call, chop off the first 4 bytes, then call
                 // `function.decode_input` to get a vector of `Token`s. Match the `Token`s
                 // with the `Param`s in `function.inputs` to create a `Vec<LogParam>`.
-                let tokens = function_abi
-                    .decode_input(&call.input.0[4..])
-                    .with_context(|| {
+                let tokens = match function_abi.decode_input(&call.input.0[4..]).with_context(
+                    || {
                         format!(
                             "Generating function inputs for the call {:?} failed, raw input: {}",
                             &function_abi,
                             hex::encode(&call.input.0)
                         )
-                    })?;
+                    },
+                ) {
+                    Ok(val) => val,
+                    Err(err) => {
+                        warn!(logger, "Failed parsing inputs, skipping"; "error" => &err.to_string());
+                        return Ok(None);
+                    }
+                };
 
                 ensure!(
                     tokens.len() == function_abi.inputs.len(),
@@ -660,10 +671,11 @@ impl DataSource {
                 let logging_extras = Arc::new(o! {
                     "function" => handler.function.to_string(),
                     "to" => format!("{}", &call.to),
+                    "transaction" => format!("{}", &transaction.hash),
                 });
                 Ok(Some(TriggerWithHandler::new_with_logging_extras(
                     MappingTrigger::Call {
-                        block,
+                        block: block.cheap_clone(),
                         transaction,
                         call: call.cheap_clone(),
                         inputs,
@@ -703,7 +715,7 @@ impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
             context,
         } = self;
 
-        info!(logger, "Resolve data source"; "name" => &name, "source" => &source.start_block);
+        info!(logger, "Resolve data source"; "name" => &name, "source_address" => format_args!("{:?}", source.address), "source_start_block" => source.start_block);
 
         let mapping = mapping.resolve(&*resolver, logger).await?;
 
